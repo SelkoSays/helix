@@ -1,6 +1,7 @@
 (require-builtin helix/core/keymaps as helix.keymaps.)
 
 (require "helix/configuration.scm")
+(require (prefix-in lazy. "helix/lazy.scm"))
 
 (provide *reverse-buffer-map-insert*
          merge-keybindings
@@ -18,7 +19,8 @@
                 (eval `(#%function-ptr-table-get #%function-ptr-table ,(string->symbol name)))))
 
 (define (get-typed-command-doc name)
-  (get-doc (trim-start-matches name ":")))
+  (define command (trim-start-matches name ":"))
+  (or (get-doc command) (lazy.lazy-plugin-command-doc command)))
 
 (define (walk-leaves keybindings)
   (if (hash? keybindings) (map walk-leaves (hash-values->list keybindings)) keybindings))
