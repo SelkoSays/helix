@@ -1,6 +1,7 @@
 pub mod components;
 mod custom_text_annotations;
 mod custom_text_edits;
+mod lazy_plugins;
 
 use arc_swap::{ArcSwap, ArcSwapAny};
 use helix_core::{
@@ -123,6 +124,7 @@ fn reload_engine() {
         // Install a new generation. Anything using the old engine at this point
         // should (hopefully) gracefully go out of scope.
         increment_generation();
+        lazy_plugins::reset(load_generation());
 
         reset_buffer_extension_keymap();
         reset_lsp_call_registry();
@@ -1621,6 +1623,10 @@ impl super::PluginSystem for SteelScriptingEngine {
     }
 
     fn call_function_by_name(&self, cx: &mut Context, name: &str, args: &[Cow<str>]) -> bool {
+        if lazy_plugins::call_function_by_name(cx, name, args) {
+            return true;
+        }
+
         if enter_engine(|x| x.global_exists(name)) {
             let mut args = args
                 .iter()
@@ -1669,6 +1675,10 @@ impl super::PluginSystem for SteelScriptingEngine {
         parts: &'a [&'a str],
         event: PromptEvent,
     ) -> bool {
+        if lazy_plugins::call_typed_command(cx, command, parts, event) {
+            return true;
+        }
+
         if enter_engine(|x| x.global_exists(command)) {
             let args = parts;
 
@@ -1731,19 +1741,24 @@ impl super::PluginSystem for SteelScriptingEngine {
     }
 
     fn get_doc_for_identifier(&self, ident: &str) -> Option<String> {
-        try_enter_engine(|engine| get_doc_for_global(engine, ident)).unwrap_or_default()
+        lazy_plugins::documentation(ident)
+            .or_else(|| try_enter_engine(|engine| get_doc_for_global(engine, ident)).flatten())
     }
 
     // Just dump docs for all top level values?
     fn available_commands<'a>(&self) -> Vec<Cow<'a, str>> {
-        try_enter_engine(|engine| {
+        let mut commands: Vec<Cow<'a, str>> = try_enter_engine(|engine| {
             engine
                 .readable_globals(GLOBAL_OFFSET.load(std::sync::atomic::Ordering::Relaxed))
                 .iter()
                 .map(|x| x.resolve().to_string().into())
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+        commands.extend(lazy_plugins::available_commands());
+        commands.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        commands.dedup_by(|left, right| left.as_ref() == right.as_ref());
+        commands
     }
 
     fn generate_sources(&self) {
@@ -1922,6 +1937,10 @@ impl super::PluginSystem for SteelScriptingEngine {
     }
 
     fn function_exists(&self, ident: &str) -> bool {
+        if lazy_plugins::recognizes(ident) {
+            return true;
+        }
+
         enter_engine(|engine| {
             if engine.global_exists(ident) {
                 if crate::commands::typed::TYPABLE_COMMAND_MAP.contains_key(ident) {
@@ -3261,7 +3280,7 @@ fn run_initialization_script(
             );
 
             match res {
-                Ok(_) => {}
+                Ok(_) => lazy_plugins::finish_initialization(guard, load_generation()),
                 Err(e) => present_error_inside_engine_context(cx, guard, e),
             }
 
@@ -4227,6 +4246,7 @@ fn configure_engine_impl(mut engine: Engine) -> Engine {
     );
 
     configure_builtin_sources(&mut engine, true);
+    lazy_plugins::register_builtin(&mut engine);
 
     // Hooks
     engine.register_fn("register-hook!", register_hook);
