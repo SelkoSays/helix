@@ -1,3 +1,9 @@
+# /home/le-mrak/.local/share/steel/cogs/helix/lazy.scm
+### **register-lazy-plugin!**
+Register commands whose modules and initializers run on first invocation.
+### **register-async-lazy-plugin!**
+Register lazy commands and queue compilation after init.scm completes.
+Evaluation and initialization still happen on first invocation.
 # /home/le-mrak/.local/share/steel/cogs/helix/treesitter.scm
 ### **TSTree?**
 Check if the given value is a treesitter tree
@@ -2994,6 +3000,13 @@ Get the current focus of the editor, as a `ViewId`.
 (editor-focus) -> ViewId
 ```
 
+### **editor-view-exists?**
+Return true when a `ViewId` still identifies a live editor view.
+
+```scheme
+(editor-view-exists? view-id) -> bool?
+```
+
 ### **editor-mode**
 
 Get the current mode of the editor
@@ -3641,6 +3654,17 @@ Removes an inlay hint by the id that was associated with the added inlay hints.
 first-line : int?
 last-line : int?
 
+### **current-visible-line-range**
+Return the focused view's visible zero-based line range as `(start end)`.
+### **set-custom-text-annotations!**
+Replace a namespace of focused-view annotations. Arguments are namespace,
+inline `(char text scope)` values, highlights `(start end scope)`, and virtual
+lines `(line text scope)` rendered after the given zero-based document line.
+### **clear-custom-text-annotations!**
+Clear one custom annotation namespace in the focused view.
+### **apply-custom-text-edits!**
+Atomically apply sorted, non-overlapping `(start end replacement)` edits to
+the focused document. Positions are zero-based character offsets.
 ### **fuzzy-match**
 Convenience function to easily fuzzy match
 on a (relatively small list of inputs). This is not recommended for building a full tui
