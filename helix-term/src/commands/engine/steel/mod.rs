@@ -1,4 +1,5 @@
 pub mod components;
+mod custom_text_annotations;
 
 use arc_swap::{ArcSwap, ArcSwapAny};
 use helix_core::{
@@ -4038,6 +4039,8 @@ fn load_misc_api(engine: &mut Engine, generate_sources: bool) {
         .register_fn_with_ctx(CTX, "remove-inlay-hint", remove_inlay_hint)
         .register_fn_with_ctx(CTX, "remove-inlay-hint-by-id", remove_inlay_hint_by_id)
         .register_fn("fuzzy-match", fuzzy_match);
+
+    custom_text_annotations::register(&mut module);
 
     if generate_sources {
         generate_module("misc.scm", &builtin_misc_module);

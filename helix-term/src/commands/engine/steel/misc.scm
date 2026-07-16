@@ -320,6 +320,23 @@
 ;;
 (define remove-inlay-hint-by-id helix.remove-inlay-hint-by-id)
 
+(provide current-visible-line-range)
+;;@doc
+;;Return the focused view's visible zero-based line range as `(start end)`.
+(define current-visible-line-range helix.current-visible-line-range)
+
+(provide set-custom-text-annotations!)
+;;@doc
+;;Replace a namespace of focused-view annotations. Arguments are namespace,
+;;inline `(char text scope)` values, highlights `(start end scope)`, and virtual
+;;lines `(line text scope)` rendered after the given zero-based document line.
+(define set-custom-text-annotations! helix.set-custom-text-annotations!)
+
+(provide clear-custom-text-annotations!)
+;;@doc
+;;Clear one custom annotation namespace in the focused view.
+(define clear-custom-text-annotations! helix.clear-custom-text-annotations!)
+
 (provide fuzzy-match)
 ;;@doc
 ;; Convenience function to easily fuzzy match

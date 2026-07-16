@@ -154,6 +154,14 @@ impl EditorView {
 
             Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
 
+            text_decorations::custom_text::add_custom_text_annotations(
+                doc,
+                view.id,
+                theme,
+                &mut overlays,
+                &mut decorations,
+            );
+
             if is_focused {
                 if config.lsp.auto_document_highlight {
                     if let Some(overlay) = Self::doc_document_highlights(doc, view, theme) {

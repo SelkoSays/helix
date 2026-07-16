@@ -1,6 +1,6 @@
 use crate::{
     align_view,
-    annotations::diagnostics::InlineDiagnostics,
+    annotations::{custom_text, diagnostics::InlineDiagnostics},
     document::{DocumentColorSwatches, DocumentInlayHints},
     editor::{GutterConfig, GutterType},
     graphics::Rect,
@@ -491,6 +491,8 @@ impl View {
                 .add_inline_annotations(other_inlay_hints, other_style)
                 .add_inline_annotations(padding_after_inlay_hints, None);
         };
+
+        custom_text::add_to_text_annotations(doc, self.id, theme, &mut text_annotations);
         let config = doc.config.load();
 
         if config.lsp.display_color_swatches {

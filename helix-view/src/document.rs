@@ -44,6 +44,7 @@ use helix_core::{
 };
 
 use crate::{
+    annotations::custom_text::CustomTextAnnotationStore,
     editor::Config,
     events::{DocumentDidChange, SelectionDidChange},
     expansion,
@@ -149,6 +150,8 @@ pub struct Document {
     ///
     /// To know if they're up-to-date, check the `id` field in `DocumentInlayHints`.
     pub(crate) inlay_hints: HashMap<ViewId, DocumentInlayHints>,
+    /// Text decorations installed by extensions, isolated by view and namespace.
+    pub(crate) custom_text_annotations: CustomTextAnnotationStore,
     /// Jump label overlays for each view.
     pub(crate) jump_labels: HashMap<ViewId, Vec<Overlay>>,
     /// LSP document highlights for each view, stored as char ranges.
@@ -746,6 +749,7 @@ impl Document {
             text,
             selections: HashMap::default(),
             inlay_hints: HashMap::default(),
+            custom_text_annotations: Default::default(),
             inlay_hints_oudated: false,
             view_data: Default::default(),
             indent_style: DEFAULT_INDENT,
@@ -1452,6 +1456,7 @@ impl Document {
         self.selections.remove(&view_id);
         self.view_data.remove(&view_id);
         self.inlay_hints.remove(&view_id);
+        self.custom_text_annotations.remove_view(view_id);
         self.jump_labels.remove(&view_id);
         self.document_highlights.remove(&view_id);
         self.document_highlight_controllers.remove(&view_id);
