@@ -337,6 +337,12 @@
 ;;Clear one custom annotation namespace in the focused view.
 (define clear-custom-text-annotations! helix.clear-custom-text-annotations!)
 
+(provide apply-custom-text-edits!)
+;;@doc
+;;Atomically apply sorted, non-overlapping `(start end replacement)` edits to
+;;the focused document. Positions are zero-based character offsets.
+(define apply-custom-text-edits! helix.apply-custom-text-edits!)
+
 (provide fuzzy-match)
 ;;@doc
 ;; Convenience function to easily fuzzy match
