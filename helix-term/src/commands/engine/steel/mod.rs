@@ -4139,6 +4139,7 @@ pub fn configure_builtin_sources(engine: &mut Engine, generate_sources: bool) {
     load_high_level_theme_api(engine, generate_sources);
     load_high_level_keymap_api(engine, generate_sources);
     load_ext_api(engine, generate_sources);
+    lazy_plugins::register_builtin(engine, generate_sources);
 
     if generate_sources {
         configure_lsp_globals();
@@ -4268,7 +4269,6 @@ fn configure_engine_impl(mut engine: Engine) -> Engine {
     );
 
     configure_builtin_sources(&mut engine, true);
-    lazy_plugins::register_builtin(&mut engine);
 
     // Hooks
     engine.register_fn("register-hook!", register_hook);

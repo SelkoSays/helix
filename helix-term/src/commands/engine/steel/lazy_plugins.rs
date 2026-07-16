@@ -184,7 +184,7 @@ fn command_doc(command: String) -> Option<String> {
     documentation(&command)
 }
 
-pub(super) fn register_builtin(engine: &mut Engine) {
+pub(super) fn register_builtin(engine: &mut Engine, generate_sources: bool) {
     let mut module = BuiltInModule::new("helix/core/lazy");
     let facade = include_str!("lazy.scm");
     module
@@ -192,8 +192,11 @@ pub(super) fn register_builtin(engine: &mut Engine) {
         .register_fn("#%register-async-lazy-plugin!", register_async_lazy_plugin)
         .register_fn("lazy-plugin-command-doc", command_doc);
 
+    if generate_sources {
+        super::generate_module("lazy.scm", facade);
+        super::configure_lsp_builtins("lazy", &module);
+    }
     engine.register_module(module);
-    super::generate_module("lazy.scm", facade);
     engine.register_steel_module("helix/lazy.scm".to_string(), facade.to_string());
 }
 
@@ -550,6 +553,23 @@ mod tests {
             Some("Documentation for test-command")
         );
         assert_eq!(available_commands(), vec![Cow::Borrowed("test-command")]);
+    }
+
+    #[test]
+    fn builtin_source_setup_can_load_lazy_dependent_modules() {
+        let _test = TEST_LOCK.lock().unwrap();
+        let mut engine = Engine::new();
+        engine.register_value(super::super::CTX, SteelVal::Void);
+        engine.register_value(super::super::CONFIG, SteelVal::Void);
+
+        super::super::configure_builtin_sources(&mut engine, false);
+
+        assert!(engine.builtin_modules().get("helix/core/lazy").is_some());
+        engine
+            .compile_and_run_raw_program(
+                "(require \"helix/lazy.scm\")\n(require \"helix/keymaps.scm\")",
+            )
+            .unwrap();
     }
 
     #[test]
