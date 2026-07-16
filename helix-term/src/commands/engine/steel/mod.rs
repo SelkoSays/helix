@@ -1426,6 +1426,10 @@ fn current_buffer_area(cx: &mut Context) -> Option<helix_view::graphics::Rect> {
     cx.editor.tree.view_id_area(focus)
 }
 
+fn editor_view_exists(cx: &mut Context, view_id: helix_view::ViewId) -> bool {
+    cx.editor.tree.try_get(view_id).is_some()
+}
+
 fn load_editor_api(engine: &mut Engine, generate_sources: bool) {
     let mut module = BuiltInModule::new("helix/core/editor");
 
@@ -1441,6 +1445,7 @@ fn load_editor_api(engine: &mut Engine, generate_sources: bool) {
 
     module
         .register_fn_with_ctx(CTX, "editor-focus", cx_current_focus)
+        .register_fn_with_ctx(CTX, "editor-view-exists?", editor_view_exists)
         .register_fn_with_ctx(CTX, "editor-mode", cx_get_mode)
         .register_fn_with_ctx(CTX, "cx->themes", get_themes)
         .register_fn_with_ctx(CTX, "editor-count", |cx: &mut Context| {

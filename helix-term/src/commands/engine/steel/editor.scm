@@ -134,6 +134,16 @@
 ;;
 (define editor-focus helix.editor-focus)
 
+(provide editor-view-exists?)
+;;@doc
+;;Return true when a `ViewId` still identifies a live editor view.
+;;
+;;```scheme
+;;(editor-view-exists? view-id) -> bool?
+;;```
+;;
+(define editor-view-exists? helix.editor-view-exists?)
+
 (provide editor-mode)
 ;;@doc
 ;;
