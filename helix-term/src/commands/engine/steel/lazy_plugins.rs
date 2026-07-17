@@ -6,7 +6,6 @@ use std::{
 
 use once_cell::sync::Lazy;
 use steel::{
-    compiler::program::RawProgramWithSymbols,
     rerrs::ErrorKind,
     rvals::IntoSteelVal,
     steel_vm::{builtin::BuiltInModule, engine::Engine, register_fn::RegisterFn},
@@ -27,7 +26,7 @@ enum ActivationState {
     Unloaded,
     Queued,
     Precompiling,
-    Ready(RawProgramWithSymbols),
+    Ready,
     Activating,
     Loaded,
     Failed(String),
@@ -47,10 +46,12 @@ struct Registry {
     commands: HashMap<String, String>,
     docs: HashMap<String, String>,
     initialization_finished: bool,
+    worker_active: bool,
 }
 
 static REGISTRY: Lazy<(Mutex<Registry>, Condvar)> =
     Lazy::new(|| (Mutex::new(Registry::default()), Condvar::new()));
+static WORKER_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 fn lazy_error(message: impl Into<String>) -> SteelErr {
     SteelErr::new(ErrorKind::Generic, message.into())
@@ -259,6 +260,7 @@ pub(super) fn finish_initialization(engine: &Engine, generation: usize) {
                 }
             })
             .collect::<Vec<_>>();
+        registry.worker_active = !names.is_empty();
         names
     };
 
@@ -266,19 +268,76 @@ pub(super) fn finish_initialization(engine: &Engine, generation: usize) {
         return;
     }
 
-    let mut worker_engine = engine.clone();
     std::thread::spawn(move || {
-        for plugin_name in queued {
-            precompile_one(&mut worker_engine, generation, plugin_name);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _worker = WORKER_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for plugin_name in queued {
+                let should_precompile = {
+                    let registry = REGISTRY.0.lock().unwrap();
+                    registry.generation == generation
+                        && registry
+                            .plugins
+                            .get(&plugin_name)
+                            .is_some_and(|plugin| matches!(plugin.state, ActivationState::Queued))
+                };
+                if !should_precompile {
+                    continue;
+                }
+                let mut worker_engine = super::background_compiler_engine();
+                precompile_one(&mut worker_engine, generation, plugin_name);
+            }
+        }));
+        let worker_panicked = result.is_err();
+        finish_precompilation(generation, worker_panicked);
+        if worker_panicked {
+            log::error!("lazy plugin background precompilation worker panicked");
         }
     });
 }
 
-fn module_source(modules: &[String]) -> String {
-    modules
-        .iter()
-        .map(|module| format!("(require {module:?})\n"))
-        .collect()
+fn finish_precompilation(generation: usize, worker_panicked: bool) {
+    let (lock, condvar) = &*REGISTRY;
+    let mut registry = lock.lock().unwrap();
+    if registry.generation == generation {
+        registry.worker_active = false;
+        if worker_panicked {
+            for plugin in registry.plugins.values_mut() {
+                if matches!(
+                    plugin.state,
+                    ActivationState::Queued | ActivationState::Precompiling
+                ) {
+                    plugin.state = ActivationState::Unloaded;
+                }
+            }
+        }
+    }
+    condvar.notify_all();
+}
+
+fn module_source(module: &str) -> String {
+    format!("(require {module:?})")
+}
+
+fn compile_modules(engine: &mut Engine, modules: &[String]) -> Result<(), SteelErr> {
+    // Steel raw programs retain engine-local compiler and module metadata. Moving
+    // one to the foreground engine can corrupt constant and global indexes, while
+    // compiling on a clone mutates the live compiler's module-emission state.
+    // Keep this worker strictly compile-only and let activation compile and run on
+    // the foreground engine. This still validates and warms module source caches
+    // without evaluating top-level forms or initializers in the background.
+    for module in modules {
+        engine.emit_raw_program(module_source(module), steel_init_file())?;
+    }
+    Ok(())
+}
+
+fn compile_and_run_modules(engine: &mut Engine, modules: &[String]) -> Result<(), SteelErr> {
+    for module in modules {
+        engine.compile_and_run_raw_program_with_path(module_source(module), steel_init_file())?;
+    }
+    Ok(())
 }
 
 fn precompile_one(engine: &mut Engine, generation: usize, plugin_name: String) {
@@ -299,7 +358,7 @@ fn precompile_one(engine: &mut Engine, generation: usize, plugin_name: String) {
         plugin.modules.clone()
     };
 
-    let result = engine.emit_raw_program(module_source(&modules), steel_init_file());
+    let result = compile_modules(engine, &modules);
 
     let (lock, condvar) = &*REGISTRY;
     let mut registry = lock.lock().unwrap();
@@ -316,15 +375,19 @@ fn precompile_one(engine: &mut Engine, generation: usize, plugin_name: String) {
         return;
     }
     plugin.state = match result {
-        Ok(program) => ActivationState::Ready(program),
-        Err(error) => ActivationState::Failed(error.to_string()),
+        Ok(()) => ActivationState::Ready,
+        Err(error) => {
+            // Precompilation is an optimization. Retry on the foreground engine
+            // when the command is actually invoked before retaining a failure.
+            log::warn!("unable to precompile lazy plugin {plugin_name:?}: {error}");
+            ActivationState::Unloaded
+        }
     };
     condvar.notify_all();
 }
 
 enum ActivationWork {
     Compile(Vec<String>),
-    Precompiled(RawProgramWithSymbols),
     Call,
 }
 
@@ -337,20 +400,26 @@ fn begin_activation(command: &str) -> Result<(String, ActivationWork), SteelErr>
                 "lazy command {command:?} disappeared during engine reload"
             )));
         };
+        if registry.worker_active
+            && registry.plugins.get(&plugin_name).is_some_and(|plugin| {
+                matches!(
+                    plugin.state,
+                    ActivationState::Unloaded
+                        | ActivationState::Queued
+                        | ActivationState::Precompiling
+                        | ActivationState::Ready
+                )
+            })
+        {
+            registry = condvar.wait(registry).unwrap();
+            continue;
+        }
         let plugin = registry.plugins.get_mut(&plugin_name).unwrap();
         let work = match &mut plugin.state {
-            ActivationState::Unloaded | ActivationState::Queued => {
+            ActivationState::Unloaded | ActivationState::Queued | ActivationState::Ready => {
                 let modules = plugin.modules.clone();
                 plugin.state = ActivationState::Activating;
                 Some(ActivationWork::Compile(modules))
-            }
-            ActivationState::Ready(_) => {
-                let ActivationState::Ready(program) =
-                    std::mem::replace(&mut plugin.state, ActivationState::Activating)
-                else {
-                    unreachable!()
-                };
-                Some(ActivationWork::Precompiled(program))
             }
             ActivationState::Loaded => Some(ActivationWork::Call),
             ActivationState::Failed(message) => return Err(lazy_error(message.clone())),
@@ -368,14 +437,19 @@ fn begin_activation(command: &str) -> Result<(String, ActivationWork), SteelErr>
     }
 }
 
-fn finish_activation(plugin_name: &str, error: Option<&SteelErr>) {
+enum ActivationCompletion<'a> {
+    Loaded,
+    Failed(&'a SteelErr),
+}
+
+fn finish_activation(plugin_name: &str, completion: ActivationCompletion<'_>) {
     let (lock, condvar) = &*REGISTRY;
     let mut registry = lock.lock().unwrap();
     if let Some(plugin) = registry.plugins.get_mut(plugin_name) {
         if matches!(plugin.state, ActivationState::Activating) {
-            plugin.state = match error {
-                None => ActivationState::Loaded,
-                Some(error) => ActivationState::Failed(error.to_string()),
+            plugin.state = match completion {
+                ActivationCompletion::Loaded => ActivationState::Loaded,
+                ActivationCompletion::Failed(error) => ActivationState::Failed(error.to_string()),
             };
         }
     }
@@ -391,20 +465,17 @@ fn activate_and_call(
     let activation = !matches!(work, ActivationWork::Call);
 
     if activation {
-        let activation_result = (|| {
-            match work {
-                ActivationWork::Compile(modules) => {
-                    engine.compile_and_run_raw_program_with_path(
-                        module_source(&modules),
-                        steel_init_file(),
-                    )?;
-                }
-                ActivationWork::Precompiled(program) => {
-                    engine.run_raw_program(program)?;
-                }
-                ActivationWork::Call => unreachable!(),
-            }
+        let load_result = match work {
+            ActivationWork::Compile(modules) => compile_and_run_modules(engine, &modules),
+            ActivationWork::Call => unreachable!(),
+        };
 
+        if let Err(error) = load_result {
+            finish_activation(&plugin_name, ActivationCompletion::Failed(&error));
+            return Err(error);
+        }
+
+        let initialization_result = (|| {
             let initializers = {
                 let (lock, _) = &*REGISTRY;
                 let registry = lock.lock().unwrap();
@@ -424,11 +495,11 @@ fn activate_and_call(
             Ok(())
         })();
 
-        if let Err(error) = activation_result {
-            finish_activation(&plugin_name, Some(&error));
+        if let Err(error) = initialization_result {
+            finish_activation(&plugin_name, ActivationCompletion::Failed(&error));
             return Err(error);
         }
-        finish_activation(&plugin_name, None);
+        finish_activation(&plugin_name, ActivationCompletion::Loaded);
     }
 
     engine.call_function_by_name_with_args(command, args)
@@ -624,7 +695,7 @@ mod tests {
             .to_string()
             .contains("recursive activation"));
         let failure = lazy_error("remember me");
-        finish_activation(&plugin, Some(&failure));
+        finish_activation(&plugin, ActivationCompletion::Failed(&failure));
         assert!(begin_activation("test-command")
             .err()
             .unwrap()
@@ -642,12 +713,14 @@ mod tests {
             "lazy-test/module.scm".into(),
             "(provide lazy-test-value) (define lazy-test-value 42)".into(),
         );
-        let mut worker = foreground.clone();
-        let program = worker
-            .emit_raw_program("(require \"lazy-test/module.scm\")", steel_init_file())
-            .unwrap();
+        let mut worker = Engine::new();
+        worker.register_steel_module(
+            "lazy-test/module.scm".into(),
+            "(provide lazy-test-value) (define lazy-test-value 42)".into(),
+        );
+        compile_modules(&mut worker, &["lazy-test/module.scm".into()]).unwrap();
         assert!(!foreground.global_exists("lazy-test-value"));
-        foreground.run_raw_program(program).unwrap();
+        compile_and_run_modules(&mut foreground, &["lazy-test/module.scm".into()]).unwrap();
         assert!(foreground.global_exists("lazy-test-value"));
     }
 
@@ -733,25 +806,47 @@ mod tests {
     fn sequential_background_precompilation_keeps_foreground_usable() {
         let _test = TEST_LOCK.lock().unwrap();
         reset_test_registry();
+        let directory = tempfile::tempdir().unwrap();
+        let dependency_path = directory.path().join("async-dependency.scm");
+        let first_path = directory.path().join("async-one.scm");
+        let second_path = directory.path().join("async-two.scm");
+        std::fs::write(
+            &dependency_path,
+            "(provide async-dependency-value) (define async-dependency-value 1)",
+        )
+        .unwrap();
+        std::fs::write(
+            &first_path,
+            format!(
+                r#"
+                    (require (prefix-in dependency. {:?}))
+                    (provide async-one-command)
+                    (define (async-one-command) dependency.async-dependency-value)
+                "#,
+                dependency_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &second_path,
+            "(provide async-two-command) (define (async-two-command) 2)",
+        )
+        .unwrap();
+
         let mut foreground = Engine::new();
-        foreground.register_steel_module(
-            "lazy-test/async-one.scm".into(),
-            "(provide async-one-command) (define (async-one-command) 1)".into(),
-        );
-        foreground.register_steel_module(
-            "lazy-test/async-two.scm".into(),
-            "(provide async-two-command) (define (async-two-command) 2)".into(),
-        );
         register_async_lazy_plugin(
             "async-one".into(),
-            vec!["lazy-test/async-one.scm".into()],
+            vec![
+                first_path.to_string_lossy().into_owned(),
+                dependency_path.to_string_lossy().into_owned(),
+            ],
             Vec::new(),
             docs("async-one-command"),
         )
         .unwrap();
         register_async_lazy_plugin(
             "async-two".into(),
-            vec!["lazy-test/async-two.scm".into()],
+            vec![second_path.to_string_lossy().into_owned()],
             Vec::new(),
             docs("async-two-command"),
         )
@@ -763,26 +858,234 @@ mod tests {
             .unwrap();
         assert!(foreground.global_exists("foreground-still-usable"));
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let (lock, condvar) = &*REGISTRY;
         let mut registry = lock.lock().unwrap();
-        while !["async-one", "async-two"].iter().all(|name| {
-            matches!(
-                registry.plugins.get(*name).unwrap().state,
-                ActivationState::Ready(_) | ActivationState::Failed(_)
-            )
-        }) {
+        while registry.worker_active
+            || !["async-one", "async-two"].iter().all(|name| {
+                matches!(
+                    registry.plugins.get(*name).unwrap().state,
+                    ActivationState::Ready | ActivationState::Failed(_)
+                )
+            })
+        {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(!remaining.is_zero(), "background precompilation timed out");
             (registry, _) = condvar.wait_timeout(registry, remaining).unwrap();
         }
         assert!(["async-one", "async-two"].iter().all(|name| matches!(
             registry.plugins.get(*name).unwrap().state,
-            ActivationState::Ready(_)
+            ActivationState::Ready
         )));
+        assert!(!registry.worker_active);
         drop(registry);
 
-        let result = activate_and_call(&mut foreground, "async-one-command", Vec::new()).unwrap();
-        assert_eq!(result, SteelVal::IntV(1));
+        let first = activate_and_call(&mut foreground, "async-one-command", Vec::new()).unwrap();
+        let second = activate_and_call(&mut foreground, "async-two-command", Vec::new()).unwrap();
+        assert_eq!(first, SteelVal::IntV(1));
+        assert_eq!(second, SteelVal::IntV(2));
+    }
+
+    #[test]
+    fn foreground_activation_failures_are_retained() {
+        let _test = TEST_LOCK.lock().unwrap();
+        reset_test_registry();
+        let mut engine = Engine::new();
+        register_lazy_plugin(
+            "retained".into(),
+            vec!["lazy-test/retained.scm".into()],
+            Vec::new(),
+            docs("retained-command"),
+        )
+        .unwrap();
+        let error = activate_and_call(&mut engine, "retained-command", Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(begin_activation("retained-command")
+            .err()
+            .unwrap()
+            .to_string()
+            .contains(&error));
+    }
+
+    #[test]
+    fn precompile_failure_retries_during_foreground_activation() {
+        let _test = TEST_LOCK.lock().unwrap();
+        reset_test_registry();
+        let mut engine = Engine::new();
+        register_async_lazy_plugin(
+            "retry".into(),
+            vec!["lazy-test/retry.scm".into()],
+            Vec::new(),
+            HashMap::from([
+                ("retry-first".into(), "First retry command".into()),
+                ("retry-second".into(), "Second retry command".into()),
+            ]),
+        )
+        .unwrap();
+        {
+            let mut registry = REGISTRY.0.lock().unwrap();
+            registry.plugins.get_mut("retry").unwrap().state = ActivationState::Queued;
+        }
+
+        precompile_one(&mut engine, 1, "retry".into());
+        assert!(matches!(
+            REGISTRY
+                .0
+                .lock()
+                .unwrap()
+                .plugins
+                .get("retry")
+                .unwrap()
+                .state,
+            ActivationState::Unloaded
+        ));
+
+        engine.register_steel_module(
+            "lazy-test/retry.scm".into(),
+            r#"
+                (provide retry-first retry-second)
+                (define (retry-first) 10)
+                (define (retry-second) 20)
+            "#
+            .into(),
+        );
+        assert_eq!(
+            activate_and_call(&mut engine, "retry-first", Vec::new()).unwrap(),
+            SteelVal::IntV(10)
+        );
+        assert_eq!(
+            activate_and_call(&mut engine, "retry-second", Vec::new()).unwrap(),
+            SteelVal::IntV(20)
+        );
+    }
+
+    #[test]
+    fn queued_plugin_can_activate_before_precompilation_starts() {
+        let _test = TEST_LOCK.lock().unwrap();
+        reset_test_registry();
+        let mut engine = Engine::new();
+        engine.register_steel_module(
+            "lazy-test/early.scm".into(),
+            r#"
+                (provide early-first early-second)
+                (define (early-first value) value)
+                (define (early-second) 2)
+            "#
+            .into(),
+        );
+        register_async_lazy_plugin(
+            "early".into(),
+            vec!["lazy-test/early.scm".into()],
+            Vec::new(),
+            HashMap::from([
+                ("early-first".into(), "First early command".into()),
+                ("early-second".into(), "Second early command".into()),
+            ]),
+        )
+        .unwrap();
+        {
+            let mut registry = REGISTRY.0.lock().unwrap();
+            registry.plugins.get_mut("early").unwrap().state = ActivationState::Queued;
+        }
+
+        assert_eq!(
+            activate_and_call(&mut engine, "early-first", vec![SteelVal::IntV(17)]).unwrap(),
+            SteelVal::IntV(17)
+        );
+        assert_eq!(
+            activate_and_call(&mut engine, "early-second", Vec::new()).unwrap(),
+            SteelVal::IntV(2)
+        );
+        assert!(matches!(
+            REGISTRY
+                .0
+                .lock()
+                .unwrap()
+                .plugins
+                .get("early")
+                .unwrap()
+                .state,
+            ActivationState::Loaded
+        ));
+    }
+
+    #[test]
+    fn activation_waits_until_the_background_queue_is_quiescent() {
+        let _test = TEST_LOCK.lock().unwrap();
+        reset_test_registry();
+        let mut engine = Engine::new();
+        engine.register_steel_module(
+            "lazy-test/barrier.scm".into(),
+            "(provide barrier-command) (define (barrier-command) 1)".into(),
+        );
+        register_async_lazy_plugin(
+            "barrier".into(),
+            vec!["lazy-test/barrier.scm".into()],
+            Vec::new(),
+            docs("barrier-command"),
+        )
+        .unwrap();
+        {
+            let mut registry = REGISTRY.0.lock().unwrap();
+            registry.worker_active = true;
+            registry.plugins.get_mut("barrier").unwrap().state = ActivationState::Ready;
+        }
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            sender
+                .send(
+                    begin_activation("barrier-command")
+                        .map(|(_, work)| matches!(work, ActivationWork::Compile(_))),
+                )
+                .unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        finish_precompilation(1, false);
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap());
+        waiter.join().unwrap();
+        finish_activation("barrier", ActivationCompletion::Loaded);
+    }
+
+    #[test]
+    fn panicked_worker_releases_waiters_for_foreground_retry() {
+        let _test = TEST_LOCK.lock().unwrap();
+        reset_test_registry();
+        register_async_lazy_plugin(
+            "worker-panic".into(),
+            vec!["lazy-test/worker-panic.scm".into()],
+            Vec::new(),
+            docs("worker-panic-command"),
+        )
+        .unwrap();
+        {
+            let mut registry = REGISTRY.0.lock().unwrap();
+            registry.worker_active = true;
+            registry.plugins.get_mut("worker-panic").unwrap().state = ActivationState::Precompiling;
+        }
+
+        finish_precompilation(1, true);
+
+        let registry = REGISTRY.0.lock().unwrap();
+        assert!(!registry.worker_active);
+        assert!(matches!(
+            registry.plugins.get("worker-panic").unwrap().state,
+            ActivationState::Unloaded
+        ));
+        drop(registry);
+        assert!(matches!(
+            begin_activation("worker-panic-command").unwrap().1,
+            ActivationWork::Compile(_)
+        ));
+        let failure = lazy_error("expected foreground failure");
+        finish_activation("worker-panic", ActivationCompletion::Failed(&failure));
     }
 }
