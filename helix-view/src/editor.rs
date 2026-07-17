@@ -1290,6 +1290,10 @@ use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 
+mod external_diagnostics;
+mod plugin_layout;
+pub use external_diagnostics::ExternalDiagnostic;
+
 pub struct Editor {
     /// Current editing mode.
     pub mode: Mode,
@@ -1945,7 +1949,9 @@ impl Editor {
             }
         }
 
-        for (view, _) in self.tree.views_mut() {
+        let view_ids = self.tree.active_view_ids().collect::<Vec<_>>();
+        for view_id in view_ids {
+            let view = self.tree.get_mut(view_id);
             let doc = doc_mut!(self, &view.doc);
             view.sync_changes(doc);
             view.gutters = config.gutters.clone();
@@ -1979,6 +1985,10 @@ impl Editor {
 
         if !matches!(action, Action::Load) {
             self.enter_normal_mode();
+        }
+
+        if matches!(action, Action::HorizontalSplit | Action::VerticalSplit) {
+            self.tree.leave_fullscreen();
         }
 
         let focust_lost = match action {
@@ -2186,6 +2196,15 @@ impl Editor {
             doc.remove_view(id);
         }
         self.tree.remove(id);
+        while self.tree.is_empty() {
+            let Some(token) = self.tree.active_temporary_layout_token() else {
+                break;
+            };
+            if let Err(error) = self.restore_temporary_layout(token) {
+                log::error!("failed to restore temporary layout after view close: {error}");
+                break;
+            }
+        }
         self._refresh();
     }
 
@@ -2327,12 +2346,15 @@ impl Editor {
         doc.append_changes_to_history(view);
         self.ensure_cursor_in_view(view_id);
         // Update jumplist selections with new document changes.
-        for (view, _focused) in self.tree.views_mut() {
+        let view_ids = self.tree.active_view_ids().collect::<Vec<_>>();
+        for view_id in view_ids {
+            let view = self.tree.get_mut(view_id);
             let doc = doc_mut!(self, &view.doc);
             view.sync_changes(doc);
         }
 
         let prev_id = std::mem::replace(&mut self.tree.focus, view_id);
+        self.tree.transfer_fullscreen(view_id);
         doc_mut!(self).mark_as_focused();
 
         let focus_lost = self.tree.get(prev_id).doc;
@@ -2430,29 +2452,40 @@ impl Editor {
             .and_then(|uri| diagnostics.get(&uri))
             .map(|diags| {
                 diags.iter().filter_map(move |(diagnostic, provider)| {
-                    let server_id = provider.language_server_id()?;
-                    let ls = language_servers.get_by_id(server_id)?;
-                    language_config
-                        .as_ref()
-                        .and_then(|c| {
-                            c.language_servers.iter().find(|features| {
-                                features.name == ls.name()
-                                    && features.has_feature(LanguageServerFeature::Diagnostics)
-                            })
-                        })
-                        .and_then(|_| {
-                            if filter(diagnostic, provider) {
-                                Document::lsp_diagnostic_to_diagnostic(
-                                    &text,
-                                    language_config.as_deref(),
-                                    diagnostic,
-                                    provider.clone(),
-                                    ls.offset_encoding(),
-                                )
-                            } else {
-                                None
-                            }
-                        })
+                    if !filter(diagnostic, provider) {
+                        return None;
+                    }
+                    match provider {
+                        DiagnosticProvider::External { .. } => {
+                            external_diagnostics::to_core_diagnostic(
+                                &text,
+                                language_config.as_deref(),
+                                diagnostic,
+                                provider.clone(),
+                            )
+                        }
+                        DiagnosticProvider::Lsp { server_id, .. } => {
+                            let ls = language_servers.get_by_id(*server_id)?;
+                            language_config
+                                .as_ref()
+                                .and_then(|c| {
+                                    c.language_servers.iter().find(|features| {
+                                        features.name == ls.name()
+                                            && features
+                                                .has_feature(LanguageServerFeature::Diagnostics)
+                                    })
+                                })
+                                .and_then(|_| {
+                                    Document::lsp_diagnostic_to_diagnostic(
+                                        &text,
+                                        language_config.as_deref(),
+                                        diagnostic,
+                                        provider.clone(),
+                                        ls.offset_encoding(),
+                                    )
+                                })
+                        }
+                    }
                 })
             })
             .into_iter()

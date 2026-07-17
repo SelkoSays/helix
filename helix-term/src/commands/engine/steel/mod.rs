@@ -2,6 +2,7 @@ pub mod components;
 mod custom_text_annotations;
 mod custom_text_edits;
 mod lazy_plugins;
+mod plugin_extensions;
 
 use arc_swap::{ArcSwap, ArcSwapAny};
 use helix_core::{
@@ -4137,6 +4138,7 @@ pub fn configure_builtin_sources(engine: &mut Engine, generate_sources: bool) {
     load_treesitter_api(engine, generate_sources);
     load_misc_api(engine, generate_sources);
     load_component_api(engine, generate_sources);
+    plugin_extensions::register_builtin(engine, generate_sources);
 
     // This depends on the components and theme api, so should
     // be loaded after.

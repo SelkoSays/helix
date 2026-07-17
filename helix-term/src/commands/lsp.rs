@@ -221,15 +221,19 @@ fn diag_picker(
         flat_diag.reserve(diags.len());
 
         for (diag, provider) in diags {
-            if let Some(ls) = provider
-                .language_server_id()
-                .and_then(|id| cx.editor.language_server_by_id(id))
-            {
+            let offset_encoding = match &provider {
+                DiagnosticProvider::External { .. } => Some(helix_lsp::OffsetEncoding::Utf8),
+                DiagnosticProvider::Lsp { server_id, .. } => cx
+                    .editor
+                    .language_server_by_id(*server_id)
+                    .map(|server| server.offset_encoding()),
+            };
+            if let Some(offset_encoding) = offset_encoding {
                 flat_diag.push(PickerDiagnostic {
                     location: Location {
                         uri: uri.clone(),
                         range: diag.range,
-                        offset_encoding: ls.offset_encoding(),
+                        offset_encoding,
                     },
                     diag,
                 });

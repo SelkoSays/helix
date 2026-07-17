@@ -1,6 +1,11 @@
 use crate::{graphics::Rect, View, ViewId};
 use slotmap::SlotMap;
 
+mod fullscreen;
+mod temporary_layout;
+
+pub use temporary_layout::TemporaryLayoutToken;
+
 // the dimensions are recomputed on window resize/tree change.
 //
 #[derive(Debug)]
@@ -8,13 +13,16 @@ pub struct Tree {
     root: ViewId,
     // (container, index inside the container)
     pub focus: ViewId,
-    // fullscreen: bool,
+    fullscreen: Option<ViewId>,
     area: Rect,
 
     nodes: SlotMap<ViewId, Node>,
 
     // used for traversals
     stack: Vec<(ViewId, Rect)>,
+
+    temporary_layouts: Vec<temporary_layout::TemporaryLayout>,
+    next_temporary_layout_token: u64,
 }
 
 #[derive(Debug)]
@@ -96,10 +104,12 @@ impl Tree {
         Self {
             root,
             focus: root,
-            // fullscreen: false,
+            fullscreen: None,
             area,
             nodes,
             stack: Vec::new(),
+            temporary_layouts: Vec::new(),
+            next_temporary_layout_token: 1,
         }
     }
 
@@ -142,6 +152,7 @@ impl Tree {
     }
 
     pub fn split(&mut self, view: View, layout: Layout) -> ViewId {
+        self.leave_fullscreen();
         let focus = self.focus;
         let parent = self.nodes[focus].parent;
 
@@ -248,6 +259,14 @@ impl Tree {
     }
 
     pub fn remove(&mut self, index: ViewId) {
+        if !self.node_is_active(index) {
+            self.remove_suspended(index);
+            return;
+        }
+
+        if self.fullscreen == Some(index) {
+            self.fullscreen = None;
+        }
         if self.focus == index {
             // focus on something else
             self.focus = self.prev();
@@ -278,6 +297,23 @@ impl Tree {
             } => Some((view.as_ref(), focus == key)),
             _ => None,
         })
+    }
+
+    /// Iterate over the views in the active layout only.
+    pub fn active_views(&self) -> impl DoubleEndedIterator<Item = (&View, bool)> {
+        let focus = self.focus;
+        self.traverse().map(move |(key, view)| (view, focus == key))
+    }
+
+    pub fn active_view_ids(&self) -> impl DoubleEndedIterator<Item = ViewId> + '_ {
+        self.traverse().map(|(id, _)| id)
+    }
+
+    /// Iterate over views that can currently receive rendered UI interaction.
+    pub fn visible_views(&self) -> impl DoubleEndedIterator<Item = (&View, bool)> {
+        let fullscreen = self.fullscreen;
+        self.active_views()
+            .filter(move |(view, _)| fullscreen.is_none_or(|id| id == view.id))
     }
 
     pub fn views_mut(&mut self) -> impl Iterator<Item = (&mut View, bool)> {
@@ -371,6 +407,18 @@ impl Tree {
             self.focus = self.root;
 
             return;
+        }
+
+        if let Some(view_id) = self.fullscreen {
+            if let Some(Node {
+                content: Content::View(view),
+                ..
+            }) = self.nodes.get_mut(view_id)
+            {
+                view.area = self.area;
+                return;
+            }
+            self.fullscreen = None;
         }
 
         self.stack.push((self.root, self.area));
