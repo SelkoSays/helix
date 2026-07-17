@@ -2108,6 +2108,7 @@ dependencies = [
  "smallvec",
  "steel-core",
  "steel-doc",
+ "steel-program-linker",
  "tempfile",
  "termina",
  "termini",
@@ -3752,6 +3753,15 @@ dependencies = [
  "serde",
  "smallvec",
  "thin-vec",
+]
+
+[[package]]
+name = "steel-program-linker"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "sha2",
+ "steel-core",
 ]
 
 [[package]]
