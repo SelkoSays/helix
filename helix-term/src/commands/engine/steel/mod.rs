@@ -258,7 +258,11 @@ fn setup() -> Engine {
         handle: thread_handle,
     }));
 
-    configure_engine_impl(engine)
+    configure_engine_impl(engine, true, true)
+}
+
+fn background_compiler_engine() -> Engine {
+    configure_engine_impl(Engine::new(), false, false)
 }
 
 // The Steel scripting engine instance. This is what drives the whole integration.
@@ -4251,7 +4255,11 @@ fn fuzzy_match(pattern: SteelString, items: SteelVal) -> Vec<SteelVal> {
     Vec::new()
 }
 
-fn configure_engine_impl(mut engine: Engine) -> Engine {
+fn configure_engine_impl(
+    mut engine: Engine,
+    generate_sources: bool,
+    update_global_offset: bool,
+) -> Engine {
     log::info!("Loading engine!");
 
     // Engine: Add search directories.
@@ -4268,7 +4276,7 @@ fn configure_engine_impl(mut engine: Engine) -> Engine {
         SteelVal::IntV(engine.engine_id().as_usize() as _),
     );
 
-    configure_builtin_sources(&mut engine, true);
+    configure_builtin_sources(&mut engine, generate_sources);
 
     // Hooks
     engine.register_fn("register-hook!", register_hook);
@@ -4527,7 +4535,9 @@ fn configure_engine_impl(mut engine: Engine) -> Engine {
     // Create directory since we can't do that in the current state
     engine.register_fn("hx.create-directory", create_directory);
 
-    GLOBAL_OFFSET.store(engine.globals().len(), Ordering::Relaxed);
+    if update_global_offset {
+        GLOBAL_OFFSET.store(engine.globals().len(), Ordering::Relaxed);
+    }
 
     engine
 }
