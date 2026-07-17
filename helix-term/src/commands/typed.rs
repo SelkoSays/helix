@@ -117,7 +117,7 @@ fn quit(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow
     }
 
     // last view and we have unsaved changes
-    if cx.editor.tree.views().count() == 1 {
+    if cx.editor.tree.active_views().count() == 1 {
         buffers_remaining_impl(cx.editor)?
     }
 
@@ -278,7 +278,7 @@ fn buffer_gather_others_impl(editor: &mut Editor, skip_visible: bool) -> Vec<Doc
     if skip_visible {
         let visible_document_ids = editor
             .tree
-            .views()
+            .active_views()
             .map(|view| &view.0.doc)
             .collect::<HashSet<_>>();
         editor
@@ -1048,6 +1048,8 @@ fn quit_all_impl(cx: &mut compositor::Context, force: bool) -> anyhow::Result<()
     if !force {
         buffers_remaining_impl(cx.editor)?;
     }
+
+    cx.editor.restore_all_temporary_layouts();
 
     // close all views
     let views: Vec<_> = cx.editor.tree.views().map(|(view, _)| view.id).collect();

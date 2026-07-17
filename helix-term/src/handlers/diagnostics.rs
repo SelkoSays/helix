@@ -237,6 +237,9 @@ fn request_document_diagnostics_for_language_severs(
                         retry_language_servers.insert(server_id);
                     }
                 }
+                Some(Some((Err(err), DiagnosticProvider::External { .. }, _))) => {
+                    log::error!("unexpected external diagnostic pull failure: {err}");
+                }
                 Some(None) => break,
                 // The request was cancelled.
                 None => return,

@@ -572,6 +572,7 @@ impl MappableCommand {
         vsplit_new, "Vertical right split scratch buffer",
         wclose, "Close window",
         wonly, "Close windows except current",
+        view_fullscreen_toggle, "Toggle focused window fullscreen",
         select_register, "Select register",
         insert_register, "Insert register",
         copy_between_registers, "Copy between two registers",
@@ -3473,7 +3474,7 @@ fn jumplist_picker(cx: &mut Context) {
     let picker = Picker::new(
         columns,
         1, // path
-        cx.editor.tree.views().flat_map(|(view, _)| {
+        cx.editor.tree.active_views().flat_map(|(view, _)| {
             view.jumps
                 .iter()
                 .rev()
@@ -6017,7 +6018,7 @@ fn vsplit_new(cx: &mut Context) {
 }
 
 fn wclose(cx: &mut Context) {
-    if cx.editor.tree.views().count() == 1 {
+    if cx.editor.tree.active_views().count() == 1 {
         if let Err(err) = typed::buffers_remaining_impl(cx.editor) {
             cx.editor.set_error(err.to_string());
             return;
@@ -6032,7 +6033,7 @@ fn wonly(cx: &mut Context) {
     let views = cx
         .editor
         .tree
-        .views()
+        .active_views()
         .map(|(v, focus)| (v.id, focus))
         .collect::<Vec<_>>();
     for (view_id, focus) in views {
@@ -6040,6 +6041,10 @@ fn wonly(cx: &mut Context) {
             cx.editor.close(view_id);
         }
     }
+}
+
+fn view_fullscreen_toggle(cx: &mut Context) {
+    cx.editor.tree.toggle_fullscreen();
 }
 
 fn select_register(cx: &mut Context) {
