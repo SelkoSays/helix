@@ -1291,6 +1291,7 @@ use futures_util::stream::{Flatten, Once};
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 
 mod external_diagnostics;
+mod linked_scroll;
 mod plugin_layout;
 pub use external_diagnostics::ExternalDiagnostic;
 
@@ -1370,6 +1371,8 @@ pub struct Editor {
     pub editor_clipping: ClippingConfiguration,
 
     pub workspace_trust: WorkspaceTrust,
+
+    linked_scroll_links: linked_scroll::LinkedScrollLinks,
 }
 
 #[derive(Default)]
@@ -1505,6 +1508,7 @@ impl Editor {
             editor_clipping: ClippingConfiguration::default(),
             dir_stack: VecDeque::with_capacity(DIR_STACK_CAP),
             workspace_trust,
+            linked_scroll_links: linked_scroll::LinkedScrollLinks::default(),
         }
     }
 
@@ -1960,6 +1964,9 @@ impl Editor {
     }
 
     fn replace_document_in_view(&mut self, current_view: ViewId, doc_id: DocumentId) {
+        if self.tree.get(current_view).doc != doc_id {
+            self.remove_linked_scroll(current_view);
+        }
         let scrolloff = self.config().scrolloff;
         let view = self.tree.get_mut(current_view);
 
@@ -2191,6 +2198,7 @@ impl Editor {
     }
 
     pub fn close(&mut self, id: ViewId) {
+        self.remove_linked_scroll(id);
         // Remove selections for the closed view on all documents.
         for doc in self.documents_mut() {
             doc.remove_view(id);
