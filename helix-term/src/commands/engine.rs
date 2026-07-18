@@ -6,7 +6,7 @@ use helix_view::{document::Mode, input::KeyEvent};
 #[cfg(unix)]
 use termina::{EventReader, Terminal};
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 use crate::{
     application::TerminalBackend,
@@ -108,6 +108,7 @@ impl ScriptingEngine {
         configuration: Arc<ArcSwapAny<Arc<Config>>>,
         language_configuration: Arc<ArcSwap<syntax::Loader>>,
         event_reader: TerminalEventReaderHandle,
+        workspace: PathBuf,
     ) {
         // Set up a flag to disable steel, even on the current build?
         #[allow(clippy::if_same_then_else, reason = "not the same with steel feature")]
@@ -132,7 +133,8 @@ impl ScriptingEngine {
                     cx,
                     configuration.clone(),
                     language_configuration.clone(),
-                    event_reader.clone()
+                    event_reader.clone(),
+                    workspace.clone()
                 )
             )
         }
@@ -274,6 +276,7 @@ pub trait PluginSystem {
         _configuration: Arc<ArcSwapAny<Arc<Config>>>,
         _language_configuration: Arc<ArcSwap<syntax::Loader>>,
         _event_reader: TerminalEventReaderHandle,
+        _workspace: PathBuf,
     ) {
     }
 

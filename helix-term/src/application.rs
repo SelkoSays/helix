@@ -143,6 +143,13 @@ impl Application {
         compositor.push(editor_view);
 
         let mut jobs = Jobs::new();
+        let steel_workspace = args
+            .files
+            .keys()
+            .find(|path| !path.is_dir())
+            .and_then(|path| path.parent())
+            .map(|parent| helix_loader::find_workspace_in(parent).0)
+            .unwrap_or_else(|| helix_loader::find_workspace().0);
         {
             let syn_loader = editor.syn_loader.clone();
 
@@ -160,6 +167,7 @@ impl Application {
                 config.clone(),
                 syn_loader,
                 crate::commands::engine::TerminalEventReaderHandle::new(terminal.backend()),
+                steel_workspace,
             );
         }
 
@@ -484,8 +492,15 @@ impl Application {
             {
                 crate::commands::ScriptingEngine::reinitialize();
 
+                let steel_workspace = doc!(self.editor)
+                    .path()
+                    .and_then(|path| path.parent())
+                    .map(|parent| helix_loader::find_workspace_in(parent).0)
+                    .unwrap_or_else(|| helix_loader::find_workspace().0);
+
                 let syn_loader = self.editor.syn_loader.clone();
                 let config = self.config.clone();
+                self.editor.clear_status();
 
                 let mut cx = crate::commands::Context {
                     register: None,
@@ -503,6 +518,7 @@ impl Application {
                     crate::commands::engine::TerminalEventReaderHandle::new(
                         self.terminal.backend(),
                     ),
+                    steel_workspace,
                 );
             }
 
@@ -511,7 +527,9 @@ impl Application {
 
         match refresh_config() {
             Ok(_) => {
-                self.editor.set_status("Config refreshed");
+                if self.editor.get_status().is_none() {
+                    self.editor.set_status("Config refreshed");
+                }
             }
             Err(err) => {
                 self.editor.set_error(err.to_string());

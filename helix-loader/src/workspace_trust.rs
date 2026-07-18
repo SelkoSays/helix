@@ -366,6 +366,7 @@ impl WorkspaceTrust {
 fn has_local_config(workspace: &Path) -> bool {
     workspace.join(".helix").join("config.toml").exists()
         || workspace.join(".helix").join("languages.toml").exists()
+        || workspace.join(".helix").join("local.scm").exists()
 }
 
 fn demote_for_query(status: TrustStatus, query: TrustQuery) -> TrustStatus {
@@ -642,6 +643,26 @@ mod test {
         write_file(&workspace.join(".helix").join("config.toml"), "a = 2");
         trust.inner.lock().remove(workspace);
         assert!(trust.workspace_restricted(workspace));
+    }
+
+    #[test]
+    fn workspace_steel_config_is_local_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        write_file(&workspace.join(".helix").join("local.scm"), "(void)");
+
+        let trust = WorkspaceTrust::new(Config::default());
+        assert!(trust.workspace_restricted(workspace));
+        assert_eq!(
+            trust.query(workspace, TrustQuery::LocalConfig),
+            TrustStatus::Untrusted
+        );
+
+        trust.trust(workspace);
+        assert_eq!(
+            trust.query(workspace, TrustQuery::LocalConfig),
+            TrustStatus::Trusted
+        );
     }
 
     #[test]
