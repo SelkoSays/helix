@@ -14,7 +14,7 @@ use helix_core::{
         rope_module, treesitter_module, SteelRopeSlice, TreeSitterMatch, TreeSitterQuery,
         TreeSitterQueryLoader, TreeSitterSyntax, TreeSitterTree,
     },
-    find_workspace, graphemes,
+    graphemes,
     syntax::{
         self,
         config::{
@@ -1607,8 +1607,15 @@ impl super::PluginSystem for SteelScriptingEngine {
         configuration: Arc<ArcSwapAny<Arc<Config>>>,
         language_configuration: Arc<ArcSwap<syntax::Loader>>,
         event_reader: TerminalEventReaderHandle,
+        workspace: PathBuf,
     ) {
-        run_initialization_script(cx, configuration, language_configuration, event_reader);
+        run_initialization_script(
+            cx,
+            configuration,
+            language_configuration,
+            event_reader,
+            workspace,
+        );
     }
 
     fn handle_keymap_event(
@@ -2215,16 +2222,9 @@ pub fn is_keymap(keymap: SteelVal) -> bool {
     }
 }
 
-fn local_config_exists() -> bool {
-    let local_helix = find_workspace().0.join(".helix");
-    local_helix.join("helix.scm").exists() && local_helix.join("init.scm").exists()
-}
-
 fn preferred_config_path(file_name: &str) -> PathBuf {
     if let Ok(steel_config_dir) = std::env::var("HELIX_STEEL_CONFIG") {
         PathBuf::from(steel_config_dir).join(file_name)
-    } else if local_config_exists() {
-        find_workspace().0.join(".helix").join(file_name)
     } else {
         helix_loader::config_dir().join(file_name)
     }
@@ -3219,6 +3219,7 @@ fn run_initialization_script(
     configuration: Arc<ArcSwapAny<Arc<Config>>>,
     language_configuration: Arc<ArcSwap<syntax::Loader>>,
     event_reader: TerminalEventReaderHandle,
+    workspace: PathBuf,
 ) {
     let now = std::time::Instant::now();
     install_event_reader(event_reader);
@@ -3232,6 +3233,9 @@ fn run_initialization_script(
 
     let helix_module_path = helix_module_file();
     let helix_init_path = steel_init_file();
+    let workspace_init_path = std::env::var_os("HELIX_STEEL_CONFIG")
+        .is_none()
+        .then(|| workspace.join(".helix").join("local.scm"));
 
     // TODO: Report the error from requiring the file!
     enter_engine(|guard| {
@@ -3254,7 +3258,7 @@ fn run_initialization_script(
                 cx,
                 CTX,
                 &format!(r#"(require {:?})"#, helix_module_path.to_str().unwrap()),
-                helix_init_path,
+                helix_init_path.clone(),
             );
 
             // Present the error in the helix.scm loading
@@ -3263,31 +3267,68 @@ fn run_initialization_script(
                 return;
             }
         } else {
-            println!("Unable to find the `helix.scm` file, creating....");
-            std::fs::write(helix_module_path, "").ok();
+            log::info!("No helix.scm found, skipping loading.");
         }
 
-        let helix_module_path = steel_init_file();
-
-        // These contents need to be registered with the path?
-        if let Ok(contents) = std::fs::read_to_string(&helix_module_path) {
+        if let Ok(contents) = std::fs::read_to_string(&helix_init_path) {
             let res = guard.run_with_reference_from_path::<Context, Context>(
                 cx,
                 CTX,
                 &contents,
-                helix_module_path,
+                helix_init_path,
             );
 
-            match res {
-                Ok(_) => lazy_plugins::finish_initialization(guard, load_generation()),
-                Err(e) => present_error_inside_engine_context(cx, guard, e),
+            if let Err(e) = res {
+                present_error_inside_engine_context(cx, guard, e);
+                return;
             }
 
             log::info!("Finished loading init.scm!")
         } else {
             log::info!("No init.scm found, skipping loading.");
-            std::fs::write(helix_module_path, "").ok();
         }
+
+        if let Some(path) = workspace_init_path.filter(|path| path.exists()) {
+            use helix_loader::workspace_trust::{TrustQuery, TrustStatus};
+
+            let raw_status = cx.editor.workspace_trust.status(&workspace);
+            let status = cx
+                .editor
+                .workspace_trust
+                .query(&workspace, TrustQuery::LocalConfig);
+            if status.is_trusted() {
+                match std::fs::read_to_string(&path) {
+                    Ok(contents) => {
+                        log::info!("Loading trusted workspace Steel config: {:?}", path);
+                        if let Err(e) = guard.run_with_reference_from_path::<Context, Context>(
+                            cx, CTX, &contents, path,
+                        ) {
+                            present_error_inside_engine_context(cx, guard, e);
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        cx.editor.set_error(format!(
+                            "Unable to read workspace Steel config {}: {error}",
+                            path.display()
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                let reason = match raw_status {
+                    TrustStatus::Stale => "stale",
+                    TrustStatus::Excluded => "excluded",
+                    _ => "untrusted",
+                };
+                cx.editor.set_warning(format!(
+                    "Skipped {reason} workspace Steel config {}; run :workspace-trust and then :config-reload",
+                    path.display()
+                ));
+            }
+        }
+
+        lazy_plugins::finish_initialization(guard, load_generation());
     });
 
     patch_callbacks(cx);
