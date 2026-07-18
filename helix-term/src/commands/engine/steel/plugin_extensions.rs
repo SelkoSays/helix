@@ -1,6 +1,7 @@
 use super::{configure_lsp_builtins, generate_module, Custom, Engine, RegisterFn, CTX};
 use crate::commands::engine::steel::Context;
 use helix_core::diagnostic::Severity;
+use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::editor::ExternalDiagnostic;
 use helix_view::tree::TemporaryLayoutToken;
 use std::{path::PathBuf, sync::Arc};
@@ -150,7 +151,37 @@ fn register_external_diagnostics(engine: &mut Engine, generate_sources: bool) {
     engine.register_module(module);
 }
 
+fn text_display_width(value: String) -> usize {
+    UnicodeWidthStr::width(value.as_str())
+}
+
+fn register_text_display(engine: &mut Engine, generate_sources: bool) {
+    let mut module = BuiltInModule::new("helix/core/text-display");
+    module.register_fn("text-display-width", text_display_width);
+
+    let source = include_str!("text-display.scm");
+    if generate_sources {
+        generate_module("text-display.scm", source);
+        configure_lsp_builtins("text-display", &module);
+    }
+    engine.register_steel_module("helix/text-display.scm".to_string(), source.to_string());
+    engine.register_module(module);
+}
+
 pub(super) fn register_builtin(engine: &mut Engine, generate_sources: bool) {
     register_view_layout(engine, generate_sources);
     register_external_diagnostics(engine, generate_sources);
+    register_text_display(engine, generate_sources);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::text_display_width;
+
+    #[test]
+    fn text_display_width_uses_terminal_cells() {
+        assert_eq!(text_display_width("abc".to_string()), 3);
+        assert_eq!(text_display_width("a界b".to_string()), 4);
+        assert_eq!(text_display_width("e\u{301}".to_string()), 1);
+    }
 }
