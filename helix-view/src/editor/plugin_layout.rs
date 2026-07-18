@@ -35,6 +35,9 @@ impl Editor {
                 document.remove_view(*view_id);
             }
         }
+        for view_id in &removed {
+            self.remove_linked_scroll(*view_id);
+        }
         if let Some(document_id) = self.tree.try_get(self.tree.focus).map(|view| view.doc) {
             if let Some(document) = self.documents.get_mut(&document_id) {
                 document.mark_as_focused();

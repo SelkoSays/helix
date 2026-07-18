@@ -2,6 +2,7 @@ pub mod components;
 mod custom_text_annotations;
 mod custom_text_edits;
 mod lazy_plugins;
+mod linked_scroll;
 mod navigation;
 mod plugin_extensions;
 
@@ -1417,6 +1418,9 @@ fn load_editor_api(engine: &mut Engine, generate_sources: bool) {
     module
         .register_fn_with_ctx(CTX, "editor-focus", cx_current_focus)
         .register_fn_with_ctx(CTX, "editor-view-exists?", editor_view_exists)
+        .register_fn_with_ctx(CTX, "editor-linked-scroll-create!", linked_scroll::create)
+        .register_fn_with_ctx(CTX, "editor-linked-scroll-peer", linked_scroll::peer)
+        .register_fn_with_ctx(CTX, "editor-linked-scroll-remove!", linked_scroll::remove)
         .register_fn_with_ctx(CTX, "editor-mode", cx_get_mode)
         .register_fn_with_ctx(CTX, "cx->themes", get_themes)
         .register_fn_with_ctx(CTX, "editor-count", |cx: &mut Context| {

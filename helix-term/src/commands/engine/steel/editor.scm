@@ -144,6 +144,22 @@
 ;;
 (define editor-view-exists? helix.editor-view-exists?)
 
+(provide editor-linked-scroll-create!)
+;;@doc
+;;Create or replace a vertical scroll link between two equal-row live views.
+;;Returns true on success and raises a precise error for invalid endpoints.
+(define editor-linked-scroll-create! helix.editor-linked-scroll-create!)
+
+(provide editor-linked-scroll-peer)
+;;@doc
+;;Return the live peer linked to a view, or `#false` when it has no link.
+(define editor-linked-scroll-peer helix.editor-linked-scroll-peer)
+
+(provide editor-linked-scroll-remove!)
+;;@doc
+;;Remove the vertical scroll link containing a view. Returns whether one existed.
+(define editor-linked-scroll-remove! helix.editor-linked-scroll-remove!)
+
 (provide editor-mode)
 ;;@doc
 ;;
