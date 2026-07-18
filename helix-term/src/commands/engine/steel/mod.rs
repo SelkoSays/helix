@@ -2,6 +2,7 @@ pub mod components;
 mod custom_text_annotations;
 mod custom_text_edits;
 mod lazy_plugins;
+mod navigation;
 mod plugin_extensions;
 
 use arc_swap::{ArcSwap, ArcSwapAny};
@@ -709,39 +710,6 @@ fn load_static_commands(engine: &mut Engine, generate_sources: bool) {
     engine.register_module(module);
 }
 
-fn goto_line_impl(cx: &mut Context, mut line: usize, extend: bool) {
-    let (view, doc) = current!(cx.editor);
-    let text = doc.text().slice(..);
-
-    if line > text.len_lines() {
-        line = text.len_lines();
-    }
-
-    let line = line.saturating_sub(1);
-
-    let selection = doc.selection(view.id).clone().transform(|range| {
-        let line_start = text.line_to_char(line);
-        range.put_cursor(text, line_start, extend)
-    });
-    crate::commands::push_jump(view, doc);
-    doc.set_selection(view.id, selection);
-}
-
-fn goto_column_impl(cx: &mut Context, char_index: usize, extend: bool) {
-    let count = cx.count();
-    let (view, doc) = current!(cx.editor);
-    let text = doc.text().slice(..);
-    let selection = doc.selection(view.id).clone().transform(|range| {
-        let line = range.cursor_line(text);
-        let line_start = text.line_to_char(line) + char_index;
-        let line_end = helix_core::line_ending::line_end_char_index(&text, line);
-        let pos = graphemes::nth_next_grapheme_boundary(text, line_start, count - 1).min(line_end);
-        range.put_cursor(text, pos, extend)
-    });
-    crate::commands::push_jump(view, doc);
-    doc.set_selection(view.id, selection);
-}
-
 fn load_typed_commands(engine: &mut Engine, generate_sources: bool) {
     let mut module = BuiltInModule::new("helix/core/typable".to_string());
 
@@ -787,8 +755,8 @@ fn load_typed_commands(engine: &mut Engine, generate_sources: bool) {
     }
 
     module
-        .register_fn_with_ctx(CTX, "goto-column", goto_column_impl)
-        .register_fn_with_ctx(CTX, "goto-line", goto_line_impl);
+        .register_fn_with_ctx(CTX, "goto-column", navigation::goto_column)
+        .register_fn_with_ctx(CTX, "goto-line", navigation::goto_line);
 
     if generate_sources {
         generate_module("commands.scm", &builtin_typable_command_module);
