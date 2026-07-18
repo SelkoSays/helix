@@ -8,6 +8,44 @@ use super::{Context, CTX};
 
 pub(super) fn register(module: &mut BuiltInModule) {
     module.register_fn_with_ctx(CTX, "apply-custom-text-edits!", apply_custom_text_edits);
+    module.register_fn_with_ctx(
+        CTX,
+        "apply-custom-text-edits-to-path!",
+        apply_custom_text_edits_to_path,
+    );
+}
+
+/// Apply edits to the document for `path`, which need not be focused or even
+/// open, so one command can edit many files while each keeps its own undo
+/// history. The document is left modified rather than written, so the whole
+/// change stays reversible until the user saves.
+fn apply_custom_text_edits_to_path(
+    cx: &mut Context,
+    path: String,
+    edits: SteelVal,
+) -> anyhow::Result<bool> {
+    let path = helix_stdx::path::canonicalize(std::path::PathBuf::from(path));
+    let doc_id = match cx.editor.document_by_path(&path).map(|doc| doc.id()) {
+        Some(doc_id) => doc_id,
+        // Load without displaying: a project-wide edit must not disturb the
+        // window layout or move the user's focus.
+        None => cx.editor.open(&path, helix_view::editor::Action::Load)?,
+    };
+
+    let view_id = cx.editor.tree.focus;
+    let Some(doc) = cx.editor.documents.get_mut(&doc_id) else {
+        return Ok(false);
+    };
+
+    let edits = parse_edits(doc.text().len_chars(), edits)?;
+    if edits.is_empty() {
+        return Ok(true);
+    }
+
+    // A document that was never displayed has no selection for this view yet.
+    doc.ensure_view_init(view_id);
+    let transaction = Transaction::change(doc.text(), edits.into_iter());
+    Ok(doc.apply(&transaction, view_id))
 }
 
 fn apply_custom_text_edits(cx: &mut Context, edits: SteelVal) -> anyhow::Result<bool> {
