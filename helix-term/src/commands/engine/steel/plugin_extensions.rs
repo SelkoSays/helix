@@ -7,6 +7,13 @@ use helix_view::tree::TemporaryLayoutToken;
 use std::{path::PathBuf, sync::Arc};
 use steel::steel_vm::builtin::BuiltInModule;
 
+// Declared here rather than in the Steel `mod.rs` so the whole extension
+// surface stays behind this one registrar.
+#[path = "regex.rs"]
+mod regex;
+#[path = "syntax_highlight.rs"]
+mod syntax_highlight;
+
 #[derive(Clone)]
 struct SteelTemporaryLayoutToken(TemporaryLayoutToken);
 
@@ -168,10 +175,38 @@ fn register_text_display(engine: &mut Engine, generate_sources: bool) {
     engine.register_module(module);
 }
 
+fn register_syntax_highlight(engine: &mut Engine, generate_sources: bool) {
+    let mut module = BuiltInModule::new("helix/core/syntax-highlight");
+    syntax_highlight::register(&mut module);
+
+    let source = include_str!("syntax-highlight.scm");
+    if generate_sources {
+        generate_module("syntax-highlight.scm", source);
+        configure_lsp_builtins("syntax-highlight", &module);
+    }
+    engine.register_steel_module("helix/syntax-highlight.scm".to_string(), source.to_string());
+    engine.register_module(module);
+}
+
+fn register_regex(engine: &mut Engine, generate_sources: bool) {
+    let mut module = BuiltInModule::new("helix/core/regex");
+    regex::register(&mut module);
+
+    let source = include_str!("regex.scm");
+    if generate_sources {
+        generate_module("regex.scm", source);
+        configure_lsp_builtins("regex", &module);
+    }
+    engine.register_steel_module("helix/regex.scm".to_string(), source.to_string());
+    engine.register_module(module);
+}
+
 pub(super) fn register_builtin(engine: &mut Engine, generate_sources: bool) {
     register_view_layout(engine, generate_sources);
     register_external_diagnostics(engine, generate_sources);
     register_text_display(engine, generate_sources);
+    register_syntax_highlight(engine, generate_sources);
+    register_regex(engine, generate_sources);
 }
 
 #[cfg(test)]

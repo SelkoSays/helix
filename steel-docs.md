@@ -255,6 +255,33 @@ Parse the syntax tree from given a language name and source
 ```
 * src : Rope?
 * lang : string?
+# /home/le-mrak/.local/share/steel/cogs/helix/syntax-highlight.scm
+### **syntax-highlight-language-for-path**
+Return the language name Helix would use for `path`, or #false when no
+language matches. Only the file name is consulted; the file need not exist.
+### **syntax-highlight-language-known?**
+Whether `language` names a language this Helix build knows about.
+### **syntax-highlight-byte-budget**
+The size in bytes above which highlighting declines, so a caller can decide
+before asking rather than being surprised by an empty result.
+### **syntax-highlight-spans**
+Highlight `text` as `language`, returning a list of `(start end style)`.
+
+`start` and `end` are character indices, not byte offsets, so they can be
+used directly with `substring`. Spans are sorted and non-overlapping, and a
+region with no highlight produces no span at all — a style is a patch over
+whatever base style the caller renders with.
+
+An unknown language, a language with no highlight query, unparsable text, or
+text over the byte budget all return the empty list rather than raising.
+# /home/le-mrak/.local/share/steel/cogs/helix/external-diagnostics.scm
+### **external-diagnostic**
+Construct a one-based external diagnostic. Severity is one of
+"hint", "info", "warning", or "error". Code and source may be #false.
+### **external-diagnostics-publish!**
+Replace every diagnostic in namespace with the supplied diagnostic list.
+### **external-diagnostics-clear!**
+Clear one external diagnostic namespace without affecting LSP diagnostics.
 # /home/le-mrak/.local/share/steel/cogs/helix/static.scm
 ### **insert_char**
 Insert a given character at the cursor cursor position
@@ -824,6 +851,8 @@ Vertical right split scratch buffer
 Close window
 ### **wonly**
 Close windows except current
+### **view_fullscreen_toggle**
+Toggle focused window fullscreen
 ### **select_register**
 Select register
 ### **insert_register**
@@ -2892,6 +2921,31 @@ Allow language servers and local config for the current workspace.
 Revoke the current workspace's trust grant or exclusion.
 ### **workspace-exclude**
 Mark the current workspace as never-prompt. Never prompts for trust again.
+# /home/le-mrak/.local/share/steel/cogs/helix/text-display.scm
+### **text-display-width**
+Return the terminal-cell width of a string using Helix's Unicode width
+implementation. This is distinct from Steel's character-counting
+string-length.
+# /home/le-mrak/.local/share/steel/cogs/helix/regex.scm
+### **regex?**
+Whether a value is a compiled regular expression.
+### **regex-compile**
+Compile a pattern, returning #false when it is invalid.
+
+Compilation never raises, because patterns arrive from live user typing and
+a half-typed pattern is a normal intermediate state.
+### **regex-pattern**
+The pattern text a regular expression was compiled from.
+### **regex-full-match?**
+Whether the whole string matches. This is not a substring search: the
+pattern is anchored at both ends before testing.
+### **regex-find**
+The first match as a `(start end)` character range, or #false.
+### **regex-find-all**
+Every non-overlapping match as a list of `(start end)` character ranges.
+### **regex-replace-all**
+Replace every match, expanding `$1` and `${name}` capture references in the
+replacement.
 # /home/le-mrak/.local/share/steel/cogs/helix/editor.scm
 ### **register-hook**
 Register a hook to be called after the event kind fired. It is not possible
@@ -3007,6 +3061,13 @@ Return true when a `ViewId` still identifies a live editor view.
 (editor-view-exists? view-id) -> bool?
 ```
 
+### **editor-linked-scroll-create!**
+Create or replace a vertical scroll link between two equal-row live views.
+Returns true on success and raises a precise error for invalid endpoints.
+### **editor-linked-scroll-peer**
+Return the live peer linked to a view, or `#false` when it has no link.
+### **editor-linked-scroll-remove!**
+Remove the vertical scroll link containing a view. Returns whether one existed.
 ### **editor-mode**
 
 Get the current mode of the editor
@@ -3691,6 +3752,20 @@ Add keybinding to the global default
 ### **deep-copy-global-keybindings**
 Deep copy the global keymap
 ### **keymap**
+# /home/le-mrak/.local/share/steel/cogs/helix/view-layout.scm
+### **view-fullscreen?**
+Return whether an editor view is currently rendered fullscreen.
+### **view-fullscreen-enter!**
+Render the focused view fullscreen without closing sibling views.
+### **view-fullscreen-leave!**
+Leave fullscreen and restore the split layout.
+### **view-fullscreen-toggle!**
+Toggle fullscreen rendering for the focused view.
+### **temporary-layout-enter!**
+Suspend the current split layout, display the requested DocumentId, and
+return an opaque restoration token.
+### **temporary-layout-restore!**
+Restore the most recently suspended layout identified by token.
 # helix/core/text
 To use, you can include with `(require-builtin helix/core/text)`
 ### **Rope?**
