@@ -6,7 +6,8 @@
          regex-full-match?
          regex-find
          regex-find-all
-         regex-replace-all)
+         regex-replace-all
+         regex-expand-match)
 
 ;;@doc
 ;; Whether a value is a compiled regular expression.
@@ -40,3 +41,8 @@
 ;; Replace every match, expanding `$1` and `${name}` capture references in the
 ;; replacement.
 (define regex-replace-all helix.regex-replace-all)
+
+;;@doc
+;; Expand the replacement for the exact `(start end)` character range in
+;; `text`, or return #false when that range is not the next regex match.
+(define regex-expand-match helix.regex-expand-match)
