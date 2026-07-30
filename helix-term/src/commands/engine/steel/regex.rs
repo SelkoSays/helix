@@ -37,7 +37,8 @@ pub(super) fn register(module: &mut BuiltInModule) {
         .register_fn("regex-full-match?", full_match)
         .register_fn("regex-find", find)
         .register_fn("regex-find-all", find_all)
-        .register_fn("regex-replace-all", replace_all);
+        .register_fn("regex-replace-all", replace_all)
+        .register_fn("regex-expand-match", expand_match);
 }
 
 fn is_regex(value: SteelVal) -> bool {
@@ -95,6 +96,59 @@ fn replace_all(regex: &SteelRegex, text: String, replacement: String) -> String 
         .regex
         .replace_all(&text, replacement.as_str())
         .into_owned()
+}
+
+/// Expand one already-known match while retaining its surrounding context.
+///
+/// Search plugins commonly receive the exact range from an external matcher.
+/// Re-running the expression against only the matched text breaks assertions
+/// such as `\b`, `^`, and `$`; searching the whole document without checking
+/// the range risks expanding a different match. Character indices keep this
+/// consistent with the rest of the Steel regex API.
+fn expand_match(
+    regex: &SteelRegex,
+    text: String,
+    start: usize,
+    end: usize,
+    replacement: String,
+) -> Option<String> {
+    let (start, end) = char_range_to_bytes(&text, start, end)?;
+    let captures = regex.regex.captures_at(&text, start)?;
+    let matched = captures.get(0)?;
+    if matched.start() != start || matched.end() != end {
+        return None;
+    }
+
+    let mut expanded = String::new();
+    captures.expand(&replacement, &mut expanded);
+    Some(expanded)
+}
+
+fn char_range_to_bytes(text: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    if start > end {
+        return None;
+    }
+
+    let mut start_byte = None;
+    let mut end_byte = None;
+    let mut character_count = 0;
+    for (character, (byte, _)) in text.char_indices().enumerate() {
+        if character == start {
+            start_byte = Some(byte);
+        }
+        if character == end {
+            end_byte = Some(byte);
+            break;
+        }
+        character_count = character + 1;
+    }
+    if start_byte.is_none() && start == character_count {
+        start_byte = Some(text.len());
+    }
+    if end_byte.is_none() && end == character_count {
+        end_byte = Some(text.len());
+    }
+    Some((start_byte?, end_byte?))
 }
 
 fn range(start: usize, end: usize) -> SteelVal {
@@ -251,6 +305,60 @@ mod tests {
             replace_all(&named, "hi there".to_string(), "<${word}>".to_string()),
             "<hi> <there>"
         );
+    }
+
+    #[test]
+    fn one_match_expands_with_its_original_context() {
+        let regex = compile(r"\bare \b".to_string()).unwrap();
+        assert_eq!(
+            expand_match(
+                &regex,
+                "we are ready".to_string(),
+                3,
+                7,
+                "were ".to_string()
+            ),
+            Some("were ".to_string())
+        );
+
+        let captures = compile(r"(?<left>\w+)@(\w+)".to_string()).unwrap();
+        assert_eq!(
+            expand_match(
+                &captures,
+                "界 a@b".to_string(),
+                2,
+                5,
+                "$2:${left}".to_string()
+            ),
+            Some("b:a".to_string())
+        );
+
+        let line_anchor = compile(r"(?mR:^are$)".to_string()).unwrap();
+        assert_eq!(
+            expand_match(
+                &line_anchor,
+                "no\nare\r\n".to_string(),
+                3,
+                6,
+                "were".to_string()
+            ),
+            Some("were".to_string())
+        );
+    }
+
+    #[test]
+    fn one_match_rejects_stale_or_invalid_ranges() {
+        let regex = compile(r"\bcat\b".to_string()).unwrap();
+        let text = "a cat".to_string();
+        assert_eq!(
+            expand_match(&regex, text.clone(), 2, 4, "dog".to_string()),
+            None
+        );
+        assert_eq!(
+            expand_match(&regex, text.clone(), 0, 1, "dog".to_string()),
+            None
+        );
+        assert_eq!(expand_match(&regex, text, 99, 100, "dog".to_string()), None);
     }
 
     #[test]
