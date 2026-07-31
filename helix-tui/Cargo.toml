@@ -16,6 +16,7 @@ default = ["termina", "crossterm"]
 steel = ["dep:steel-core", "helix-view/steel", "helix-core/steel"]
 
 [dependencies]
+base64 = "0.22"
 helix-view = { path = "../helix-view", features = ["term"] }
 helix-core = { path = "../helix-core" }
 
@@ -31,3 +32,6 @@ steel-core = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 crossterm = { version = "0.28", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

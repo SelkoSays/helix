@@ -9,6 +9,12 @@ use helix_view::{
     theme::Color,
 };
 
+mod kitty_graphics;
+pub use kitty_graphics::{
+    available as kitty_graphics_available, queue_delete as queue_kitty_delete,
+    queue_delete_all as queue_kitty_delete_all, queue_upload as queue_kitty_upload,
+};
+
 #[cfg(all(feature = "termina", not(windows)))]
 mod termina;
 #[cfg(all(feature = "termina", not(windows)))]
