@@ -10,7 +10,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 use helix_core::unicode::width::UnicodeWidthStr;
@@ -19,7 +22,10 @@ use helix_view::{
     editor::Action,
     graphics::{Color, Style},
 };
-use image::{imageops, ImageReader, Limits, Rgba};
+use image::{
+    codecs::png::PngEncoder, imageops, ExtendedColorType, ImageEncoder, ImageReader, Limits, Rgba,
+    RgbaImage,
+};
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
@@ -43,6 +49,19 @@ const MAX_REMOTE_MEDIA: usize = 8;
 const MAX_TEX_BYTES: usize = 16 * 1024;
 const MAX_TEX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MATH_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_KITTY_COLUMNS: u32 = 64;
+const MAX_KITTY_ROWS: u32 = 64;
+const KITTY_PLACEHOLDER: char = '\u{10eeee}';
+const KITTY_DIACRITICS: [char; 64] = [
+    '\u{0305}', '\u{030d}', '\u{030e}', '\u{0310}', '\u{0312}', '\u{033d}', '\u{033e}', '\u{033f}',
+    '\u{0346}', '\u{034a}', '\u{034b}', '\u{034c}', '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}',
+    '\u{035b}', '\u{0363}', '\u{0364}', '\u{0365}', '\u{0366}', '\u{0367}', '\u{0368}', '\u{0369}',
+    '\u{036a}', '\u{036b}', '\u{036c}', '\u{036d}', '\u{036e}', '\u{036f}', '\u{0483}', '\u{0484}',
+    '\u{0485}', '\u{0486}', '\u{0487}', '\u{0592}', '\u{0593}', '\u{0594}', '\u{0595}', '\u{0597}',
+    '\u{0598}', '\u{0599}', '\u{059c}', '\u{059d}', '\u{059e}', '\u{059f}', '\u{05a0}', '\u{05a1}',
+    '\u{05a8}', '\u{05a9}', '\u{05ab}', '\u{05ac}', '\u{05af}', '\u{05c4}', '\u{0610}', '\u{0611}',
+    '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}', '\u{0616}', '\u{0617}', '\u{0657}', '\u{0658}',
+];
 
 #[derive(Clone, Debug)]
 enum RenderStyle {
@@ -120,12 +139,14 @@ struct MarkdownRender {
     code_blocks: Vec<CodeBlock>,
     media: Vec<Media>,
     formulas: Vec<Formula>,
+    kitty_ids: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaMode {
     External,
     Unicode,
+    Kitty,
 }
 
 impl MediaMode {
@@ -133,7 +154,8 @@ impl MediaMode {
         match value {
             "external" => Ok(Self::External),
             "unicode" => Ok(Self::Unicode),
-            _ => anyhow::bail!("local media mode must be external or unicode"),
+            "kitty" => Ok(Self::Kitty),
+            _ => anyhow::bail!("local media mode must be external, unicode, or kitty"),
         }
     }
 }
@@ -143,6 +165,7 @@ struct MediaEdit {
     range: Range<usize>,
     text: String,
     styles: Vec<StyledRange>,
+    kitty_id: Option<u32>,
 }
 
 #[derive(Default)]
@@ -152,6 +175,7 @@ struct MathCache {
 }
 
 static MATH_CACHE: OnceLock<Mutex<MathCache>> = OnceLock::new();
+static NEXT_KITTY_ID: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Clone)]
 struct SteelMarkdownRender(Arc<MarkdownRender>);
@@ -225,6 +249,7 @@ struct Builder {
     code_blocks: Vec<CodeBlock>,
     media: Vec<Media>,
     formulas: Vec<Formula>,
+    kitty_ids: Vec<u32>,
     node_index: usize,
     heading_ids: HashMap<String, usize>,
 }
@@ -243,6 +268,7 @@ impl Builder {
             code_blocks: Vec::new(),
             media: Vec::new(),
             formulas: Vec::new(),
+            kitty_ids: Vec::new(),
             node_index: 0,
             heading_ids: HashMap::new(),
         }
@@ -373,6 +399,7 @@ impl Builder {
             code_blocks: self.code_blocks,
             media: self.media,
             formulas: self.formulas,
+            kitty_ids: self.kitty_ids,
         }
     }
 }
@@ -1249,9 +1276,22 @@ fn render_local_media(
     raster_math: bool,
 ) -> SteelMarkdownRender {
     let mut edits = Vec::new();
+    let kitty_available = tui::backend::kitty_graphics_available();
+    let media_mode = if mode == MediaMode::Kitty && !kitty_available {
+        MediaMode::External
+    } else {
+        mode
+    };
+    let math_mode = if mode == MediaMode::Kitty && !kitty_available {
+        MediaMode::Unicode
+    } else {
+        mode
+    };
     if raster_math {
         for formula in &render.0.formulas {
-            if let Ok(edit) = raster_math_edit(formula, render.0.width, background, true_color) {
+            if let Ok(edit) =
+                raster_math_edit(formula, render.0.width, math_mode, background, true_color)
+            {
                 edits.push(edit);
             }
         }
@@ -1269,10 +1309,10 @@ fn render_local_media(
                 Ok(media_status_edit(media, "remote item limit exceeded", None))
             } else {
                 remote_count += 1;
-                fetch_remote_media_edit(media, render.0.width, mode, background, true_color)
+                fetch_remote_media_edit(media, render.0.width, media_mode, background, true_color)
             }
         } else if !has_scheme(&media.destination) {
-            decode_media_edit(media, render.0.width, mode, background, true_color)
+            decode_media_edit(media, render.0.width, media_mode, background, true_color)
         } else {
             continue;
         };
@@ -1286,6 +1326,7 @@ fn render_local_media(
 fn raster_math_edit(
     formula: &Formula,
     render_width: usize,
+    mode: MediaMode,
     background: [u8; 3],
     true_color: bool,
 ) -> anyhow::Result<MediaEdit> {
@@ -1314,6 +1355,15 @@ fn raster_math_edit(
     );
     let cells = image.width() as usize * image.height().div_ceil(2) as usize;
     anyhow::ensure!(cells <= MAX_MEDIA_CELLS, "raster math exceeds cell limit");
+
+    if mode == MediaMode::Kitty {
+        return kitty_image_edit(
+            formula.output.clone(),
+            &image,
+            String::new(),
+            formula.display,
+        );
+    }
 
     let mut text = String::new();
     let mut styles = Vec::with_capacity(cells);
@@ -1350,6 +1400,7 @@ fn raster_math_edit(
         range: formula.output.clone(),
         text,
         styles,
+        kitty_id: None,
     })
 }
 
@@ -1517,14 +1568,36 @@ fn decode_media_edit_from_path(
     let mut reader = ImageReader::open(&path)?.with_guessed_format()?;
     reader.limits(media_limits());
     let image = reader.decode()?.to_rgba8();
-    let max_width = render_width.clamp(MIN_WIDTH, MAX_WIDTH) as u32;
-    let max_pixel_height = (MAX_MEDIA_HEIGHT_CELLS * 2) as u32;
+    let max_width = if mode == MediaMode::Kitty {
+        (render_width.clamp(MIN_WIDTH, MAX_WIDTH) as u32).min(MAX_KITTY_COLUMNS)
+    } else {
+        render_width.clamp(MIN_WIDTH, MAX_WIDTH) as u32
+    };
+    let max_pixel_height = if mode == MediaMode::Kitty {
+        MAX_KITTY_ROWS * 2
+    } else {
+        (MAX_MEDIA_HEIGHT_CELLS * 2) as u32
+    };
     let image = imageops::thumbnail(&image, max_width, max_pixel_height);
     let cells = image.width() as usize * image.height().div_ceil(2) as usize;
     anyhow::ensure!(
         cells <= MAX_MEDIA_CELLS,
         "rendered image exceeds cell limit"
     );
+
+    if mode == MediaMode::Kitty {
+        let header = format!(
+            "🖼 {} — {} [{}×{}; kitty]\n",
+            media.alt, media.destination, width, height
+        );
+        return kitty_image_edit(media.output.clone(), &image, header, true).or_else(|_| {
+            Ok(media_status_edit(
+                media,
+                "Kitty upload unavailable; external",
+                Some((width, height)),
+            ))
+        });
+    }
 
     let mut text = format!(
         "🖼 {} — {} [{}×{}; unicode]\n",
@@ -1560,7 +1633,77 @@ fn decode_media_edit_from_path(
         range: media.output.clone(),
         text,
         styles,
+        kitty_id: None,
     })
+}
+
+fn kitty_image_edit(
+    range: Range<usize>,
+    image: &RgbaImage,
+    header: String,
+    newline_after_last: bool,
+) -> anyhow::Result<MediaEdit> {
+    let columns = image.width().min(MAX_KITTY_COLUMNS);
+    let rows = image.height().div_ceil(2).min(MAX_KITTY_ROWS);
+    anyhow::ensure!(columns > 0 && rows > 0, "Kitty image has no cells");
+
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png).write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        ExtendedColorType::Rgba8,
+    )?;
+    anyhow::ensure!(
+        png.len() as u64 <= MAX_MEDIA_BYTES,
+        "Kitty PNG exceeds byte limit"
+    );
+
+    let id = next_kitty_id();
+    anyhow::ensure!(
+        tui::backend::queue_kitty_upload(id, png, columns as u16, rows as u16),
+        "Kitty graphics queue unavailable"
+    );
+
+    let mut text = header;
+    let mut styles = Vec::with_capacity((columns * rows) as usize + 1);
+    if !text.is_empty() {
+        styles.push(StyledRange {
+            range: 0..text.chars().count(),
+            style: RenderStyle::Scope("ui.text.inactive".to_string()),
+        });
+    }
+    let color = Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8);
+    for row in 0..rows as usize {
+        for column in 0..columns as usize {
+            let start = text.chars().count();
+            text.push(KITTY_PLACEHOLDER);
+            text.push(KITTY_DIACRITICS[row]);
+            text.push(KITTY_DIACRITICS[column]);
+            styles.push(StyledRange {
+                range: start..start + 3,
+                style: RenderStyle::Concrete(Style::default().fg(color)),
+            });
+        }
+        if row + 1 < rows as usize || newline_after_last {
+            text.push('\n');
+        }
+    }
+    Ok(MediaEdit {
+        range,
+        text,
+        styles,
+        kitty_id: Some(id),
+    })
+}
+
+fn next_kitty_id() -> u32 {
+    loop {
+        let id = NEXT_KITTY_ID.fetch_add(1, Ordering::Relaxed) & 0x00ff_ffff;
+        if id != 0 {
+            return id;
+        }
+    }
 }
 
 fn fetch_remote_media_edit(
@@ -1652,6 +1795,7 @@ fn media_status_edit(media: &Media, status: &str, dimensions: Option<(u32, u32)>
             range: 0..length,
             style: RenderStyle::Scope("ui.text.inactive".to_string()),
         }],
+        kitty_id: None,
     }
 }
 
@@ -1730,6 +1874,7 @@ fn apply_media_edits(render: &MarkdownRender, mut edits: Vec<MediaEdit>) -> Mark
     let mut text = String::new();
     let mut cursor = 0;
     let mut inserted_styles = Vec::new();
+    let mut kitty_ids = Vec::new();
     for edit in &edits {
         if edit.range.start < cursor {
             continue;
@@ -1741,6 +1886,9 @@ fn apply_media_edits(render: &MarkdownRender, mut edits: Vec<MediaEdit>) -> Mark
             style.range = offset + style.range.start..offset + style.range.end;
             style
         }));
+        if let Some(id) = edit.kitty_id {
+            kitty_ids.push(id);
+        }
         cursor = edit.range.end;
     }
     text.push_str(char_slice(
@@ -1770,6 +1918,7 @@ fn apply_media_edits(render: &MarkdownRender, mut edits: Vec<MediaEdit>) -> Mark
     let mut updated = render.clone();
     updated.text = text;
     updated.styles = styles;
+    updated.kitty_ids = kitty_ids;
     updated.mappings = render
         .mappings
         .iter()
@@ -1884,6 +2033,13 @@ fn markdown_render_width(render: &SteelMarkdownRender) -> usize {
 
 fn markdown_render_source_unchanged(render: &SteelMarkdownRender, source: String) -> bool {
     render.0.source_text == source
+}
+
+fn markdown_render_release_media(render: &SteelMarkdownRender) -> usize {
+    for id in &render.0.kitty_ids {
+        tui::backend::queue_kitty_delete(*id);
+    }
+    render.0.kitty_ids.len()
 }
 
 fn markdown_render_styles(render: &SteelMarkdownRender) -> SteelVal {
@@ -2170,13 +2326,16 @@ pub(super) fn register(module: &mut BuiltInModule) {
         .register_fn_with_ctx(CTX, "markdown-render-apply-focused!", apply_focused)
         .register_fn_with_ctx(CTX, "markdown-render-clear-focused!", clear_focused)
         .register_fn_with_ctx(CTX, "markdown-preview-open-target!", open_target)
-        .register_fn("markdown-render-formulas", markdown_render_formulas);
+        .register_fn("markdown-render-formulas", markdown_render_formulas)
+        .register_fn(
+            "markdown-render-release-media!",
+            markdown_render_release_media,
+        );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
     use std::fs::File;
 
     #[test]
@@ -2346,7 +2505,7 @@ mod tests {
             output: 0..6,
             source: 0..12,
         };
-        let edit = raster_math_edit(&formula, 80, [0, 0, 0], true).unwrap();
+        let edit = raster_math_edit(&formula, 80, MediaMode::Unicode, [0, 0, 0], true).unwrap();
         assert!(edit.text.contains('▀'));
         assert!(edit
             .styles

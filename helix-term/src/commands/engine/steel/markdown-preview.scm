@@ -13,6 +13,7 @@
          markdown-render-anchor-output
          markdown-render-local-media!
          markdown-render-formulas
+         markdown-render-release-media!
          markdown-render-source-for-output
          markdown-render-output-for-source
          markdown-render-apply-focused!
@@ -61,6 +62,7 @@
 
 ;; Formula rows are `(tex display? output-start output-end source-start source-end)`.
 (define markdown-render-formulas helix.markdown-render-formulas)
+(define markdown-render-release-media! helix.markdown-render-release-media!)
 (define markdown-render-source-for-output helix.markdown-render-source-for-output)
 (define markdown-render-output-for-source helix.markdown-render-output-for-source)
 

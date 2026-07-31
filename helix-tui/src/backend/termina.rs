@@ -17,7 +17,7 @@ use termina::{
 
 use crate::{buffer::Cell, terminal::Config};
 
-use super::Backend;
+use super::{kitty_graphics, Backend};
 
 // These macros are helpers to set/unset modes like bracketed paste or enter/exit the alternate
 // screen.
@@ -45,6 +45,58 @@ fn term_program() -> Option<String> {
 }
 fn vte_version() -> Option<usize> {
     std::env::var("VTE_VERSION").ok()?.parse().ok()
+}
+
+fn graphics_probe_supported(response: &[u8]) -> bool {
+    response
+        .windows(b"\x1b_Gi=31;OK\x1b\\".len())
+        .any(|window| window == b"\x1b_Gi=31;OK\x1b\\")
+}
+
+#[cfg(unix)]
+fn probe_kitty_graphics(terminal: &mut PlatformTerminal) -> io::Result<bool> {
+    if std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some() {
+        return Ok(false);
+    }
+    write!(terminal, "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c")?;
+    terminal.flush()?;
+
+    let mut response = Vec::with_capacity(512);
+    let mut poll_fd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    while std::time::Instant::now() < deadline && response.len() < 4096 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        // SAFETY: `poll_fd` and the stack byte buffer below remain valid for
+        // the duration of each libc call; stdin is already in terminal raw mode.
+        let ready = unsafe {
+            libc::poll(
+                &mut poll_fd,
+                1,
+                remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+            )
+        };
+        if ready <= 0 {
+            break;
+        }
+        let mut chunk = [0u8; 512];
+        // SAFETY: the byte slice is writable for exactly `chunk.len()` bytes.
+        let read =
+            unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if read <= 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..read as usize]);
+        if response.windows(3).any(|window| window == b"\x1b[c")
+            || response.windows(4).any(|window| window == b"\x1b[?c")
+        {
+            break;
+        }
+    }
+    Ok(graphics_probe_supported(&response))
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -96,6 +148,12 @@ impl TerminaBackend {
         const TEST_COLOR: RgbColor = RgbColor::new(59, 34, 76);
 
         terminal.enter_raw_mode()?;
+
+        let kitty_graphics = probe_kitty_graphics(&mut terminal).unwrap_or_else(|error| {
+            log::debug!("Kitty graphics capability query failed: {error}");
+            false
+        });
+        kitty_graphics::set_available(kitty_graphics);
 
         let mut capabilities = Capabilities::default();
         let mut original_background_color = None;
@@ -455,6 +513,8 @@ impl Backend for TerminaBackend {
     }
 
     fn restore(&mut self) -> io::Result<()> {
+        kitty_graphics::queue_delete_all();
+        kitty_graphics::drain(&mut self.terminal)?;
         self.disable_extensions()?;
         self.disable_mouse_capture()?;
         write!(
@@ -478,6 +538,7 @@ impl Backend for TerminaBackend {
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
         self.start_synchronized_render()?;
+        kitty_graphics::drain(&mut self.terminal)?;
 
         let mut fg = Color::Reset;
         let mut bg = Color::Reset;
@@ -595,6 +656,8 @@ impl Backend for TerminaBackend {
 
     fn clear(&mut self) -> io::Result<()> {
         self.start_synchronized_render()?;
+        kitty_graphics::queue_delete_all();
+        kitty_graphics::drain(&mut self.terminal)?;
         write!(
             self.terminal,
             "{}",
@@ -648,6 +711,9 @@ impl Drop for TerminaBackend {
         // Avoid resetting the terminal while panicking because we set a panic hook above in
         // `Self::new`.
         if !std::thread::panicking() {
+            kitty_graphics::queue_delete_all();
+            let _ = kitty_graphics::drain(&mut self.terminal);
+            kitty_graphics::set_available(false);
             let _ = self.disable_extensions();
             let _ = self.disable_mouse_capture();
             let _ = write!(
@@ -664,6 +730,17 @@ impl Drop for TerminaBackend {
             // NOTE: Drop for Platform terminal resets the mode and flushes the buffer when not
             // panicking.
         }
+    }
+}
+
+#[cfg(test)]
+mod kitty_graphics_tests {
+    use super::graphics_probe_supported;
+
+    #[test]
+    fn capability_requires_the_protocol_query_response() {
+        assert!(graphics_probe_supported(b"\x1b_Gi=31;OK\x1b\\\x1b[?1;2c"));
+        assert!(!graphics_probe_supported(b"\x1b[?1;2c"));
     }
 }
 
