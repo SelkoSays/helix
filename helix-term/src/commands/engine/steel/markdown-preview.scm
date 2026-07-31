@@ -10,6 +10,7 @@
          markdown-render-code-blocks
          markdown-render-media
          markdown-render-mappings
+         markdown-render-anchor-output
          markdown-render-source-for-output
          markdown-render-output-for-source
          markdown-render-apply-focused!
@@ -49,6 +50,7 @@
 
 ;; Mapping rows are `(output-start output-end source-start source-end node-id)`.
 (define markdown-render-mappings helix.markdown-render-mappings)
+(define markdown-render-anchor-output helix.markdown-render-anchor-output)
 (define markdown-render-source-for-output helix.markdown-render-source-for-output)
 (define markdown-render-output-for-source helix.markdown-render-output-for-source)
 
