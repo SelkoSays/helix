@@ -1,8 +1,18 @@
 use helix_core::{syntax::OverlayHighlights, Position};
-use helix_view::{annotations::custom_text::CustomVirtualLine, Document, Theme, ViewId};
+use helix_view::{
+    annotations::custom_text::{CustomHighlightStyle, CustomVirtualLine},
+    graphics::Style,
+    Document, Theme, ViewId,
+};
 
 use super::{Decoration, DecorationManager};
 use crate::ui::document::{LinePos, TextRenderer};
+
+#[derive(Clone, Debug)]
+pub(in crate::ui) struct ConcreteStyleRange {
+    pub range: std::ops::Range<usize>,
+    pub style: Style,
+}
 
 struct CustomVirtualText<'a> {
     lines: Vec<&'a CustomVirtualLine>,
@@ -40,6 +50,7 @@ pub(in crate::ui) fn add_custom_text_annotations<'a>(
     view_id: ViewId,
     theme: &'a Theme,
     overlays: &mut Vec<OverlayHighlights>,
+    concrete: &mut Vec<ConcreteStyleRange>,
     decorations: &mut DecorationManager<'a>,
 ) {
     let Some(namespaces) = doc.custom_text_annotations(view_id) else {
@@ -48,8 +59,16 @@ pub(in crate::ui) fn add_custom_text_annotations<'a>(
 
     for annotations in namespaces.values() {
         for highlight in &annotations.highlights {
-            if let Some(scope) = theme.find_highlight(&highlight.scope) {
-                overlays.push(OverlayHighlights::single(scope, highlight.range.clone()));
+            match &highlight.style {
+                CustomHighlightStyle::Scope(scope) => {
+                    if let Some(scope) = theme.find_highlight(scope) {
+                        overlays.push(OverlayHighlights::single(scope, highlight.range.clone()));
+                    }
+                }
+                CustomHighlightStyle::Concrete(style) => concrete.push(ConcreteStyleRange {
+                    range: highlight.range.clone(),
+                    style: *style,
+                }),
             }
         }
     }

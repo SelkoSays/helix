@@ -1,9 +1,11 @@
 use helix_core::text_annotations::InlineAnnotation;
 use helix_view::annotations::custom_text::{
-    CustomHighlight, CustomInlineAnnotation, CustomTextAnnotations, CustomVirtualLine,
+    CustomHighlight, CustomHighlightStyle, CustomInlineAnnotation, CustomTextAnnotations,
+    CustomVirtualLine,
 };
+use helix_view::graphics::Style;
 use steel::{
-    rvals::SteelString,
+    rvals::{AsRefSteelVal, SteelString},
     steel_vm::{builtin::BuiltInModule, register_fn::RegisterFn},
     SteelVal,
 };
@@ -96,13 +98,13 @@ fn parse_annotations(
     let highlights = rows(highlights)
         .into_iter()
         .filter_map(|row| match row.as_slice() {
-            [start, end, scope] => Some((integer(start)?, integer(end)?, string(scope)?)),
+            [start, end, style] => Some((integer(start)?, integer(end)?, highlight_style(style)?)),
             _ => None,
         })
-        .filter_map(|(start, end, scope)| {
+        .filter_map(|(start, end, style)| {
             (start < end && end <= char_len).then_some(CustomHighlight {
                 range: start..end,
-                scope,
+                style,
             })
         })
         .collect();
@@ -148,6 +150,16 @@ fn string(value: &SteelVal) -> Option<String> {
         SteelVal::StringV(value) | SteelVal::SymbolV(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn highlight_style(value: &SteelVal) -> Option<CustomHighlightStyle> {
+    if let Some(scope) = string(value) {
+        return Some(CustomHighlightStyle::Scope(scope));
+    }
+    Style::as_ref(value)
+        .ok()
+        .map(|style| *style)
+        .map(CustomHighlightStyle::Concrete)
 }
 
 #[cfg(test)]
