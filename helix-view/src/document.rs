@@ -219,6 +219,15 @@ pub struct Document {
     pub name: Option<String>,
     pub readonly: bool,
 
+    /// Keep this buffer even when it looks disposable.
+    ///
+    /// `Action::Replace` deletes the buffer it switches away from when that
+    /// buffer is unmodified and has no path, treating the pair as a proxy for
+    /// "empty scratch". A generated buffer — a rendered preview, say — is
+    /// legitimately both while still being the point of the window, so it opts
+    /// out here.
+    pub pinned: bool,
+
     pub previous_diagnostic_ids: HashMap<LanguageServerId, String>,
 
     /// Annotations for LSP document color swatches
@@ -774,6 +783,7 @@ impl Document {
             focused_at: std::time::Instant::now(),
             name: None,
             readonly: false,
+            pinned: false,
             jump_labels: HashMap::new(),
             document_highlights: HashMap::new(),
             code_action_hints: HashSet::new(),

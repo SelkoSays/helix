@@ -20,7 +20,7 @@ use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::{
     annotations::custom_text::{CustomHighlight, CustomHighlightStyle, CustomTextAnnotations},
     editor::Action,
-    graphics::{Color, Style},
+    graphics::{Color, Modifier, Style},
 };
 use image::{
     codecs::png::PngEncoder, imageops, ExtendedColorType, ImageEncoder, ImageReader, Limits, Rgba,
@@ -62,6 +62,9 @@ const ASSUMED_CELL_HEIGHT: u32 = 16;
 const KITTY_PLACEHOLDER: char = '\u{10eeee}';
 /// Indentation alone reads poorly once lists nest; vary the marker by depth.
 const BULLETS: [char; 5] = ['•', '◦', '▪', '‣', '⁃'];
+/// Below roughly six cells of height a rasterized formula stops resolving its
+/// glyphs, and readable text is the better answer.
+const MIN_MATH_PIXEL_ROWS: u32 = 12;
 const KITTY_DIACRITICS: [char; 64] = [
     '\u{0305}', '\u{030d}', '\u{030e}', '\u{0310}', '\u{0312}', '\u{033d}', '\u{033e}', '\u{033f}',
     '\u{0346}', '\u{034a}', '\u{034b}', '\u{034c}', '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}',
@@ -255,6 +258,10 @@ struct Builder {
     /// them belongs to neither run.  Carry it between emissions instead of
     /// deriving it per call, or `a *b* c` collapses to `abc`.
     pending_space: bool,
+    /// Weight applied to whatever is emitted next, on top of its theme scope.
+    /// Emphasis that relies on the theme declaring `modifiers` renders as a
+    /// bare colour under themes that only set one, so the renderer states it.
+    emphasis: Modifier,
     styles: Vec<StyledRange>,
     mappings: Vec<SourceMap>,
     anchors: HashMap<String, usize>,
@@ -275,6 +282,7 @@ impl Builder {
             width: width.clamp(MIN_WIDTH, MAX_WIDTH),
             column: 0,
             pending_space: false,
+            emphasis: Modifier::empty(),
             styles: Vec::new(),
             mappings: Vec::new(),
             anchors: HashMap::new(),
@@ -337,6 +345,15 @@ impl Builder {
                 self.styles.push(StyledRange {
                     range: start..end,
                     style: RenderStyle::Scope((*scope).to_string()),
+                });
+            }
+            // Carries no colour, so the theme still owns every colour, and
+            // concrete styles are patched after scope overlays, so the modifier
+            // cannot be dropped on the way to the terminal.
+            if !self.emphasis.is_empty() {
+                self.styles.push(StyledRange {
+                    range: start..end,
+                    style: RenderStyle::Concrete(Style::default().add_modifier(self.emphasis)),
                 });
             }
             self.mappings.push(SourceMap {
@@ -563,12 +580,14 @@ fn render(
                             let (label, scope) = callout(kind);
                             let node = builder.node("callout");
                             builder.emit_raw("┌─ ", &[scope], source_range.clone(), &node);
+                            builder.emphasis = Modifier::BOLD;
                             builder.emit_raw(
                                 label,
                                 &[scope, "markup.bold"],
                                 source_range.clone(),
                                 &node,
                             );
+                            builder.emphasis = Modifier::empty();
                             builder.newline();
                         }
                     }
@@ -854,7 +873,9 @@ fn render(
                 let scopes = active_scopes(&tags, heading.as_ref().map(|state| state.level));
                 let refs = scopes.iter().map(String::as_str).collect::<Vec<_>>();
                 let node = builder.node("text");
+                builder.emphasis = active_modifier(&tags);
                 builder.emit_wrapped(&text, &refs, source_range, &node, &"│ ".repeat(quote_depth));
+                builder.emphasis = Modifier::empty();
             }
             Event::Code(text) => {
                 if let Some(state) = heading.as_mut() {
@@ -864,7 +885,9 @@ fn render(
                     state.label.push_str(&text);
                 }
                 let node = builder.node("inline-code");
+                builder.emphasis = active_modifier(&tags);
                 builder.emit_inline(&text, &["markup.raw.inline"], source_range, &node);
+                builder.emphasis = Modifier::empty();
             }
             Event::InlineMath(math) => {
                 let rendered = terminal_math(&math);
@@ -1210,12 +1233,14 @@ fn render_code(cx: &mut Context, builder: &mut Builder, state: NativeCodeState) 
         builder.emit_raw(&"─".repeat(inner + 2), &border, state.source.clone(), &node);
     } else {
         builder.emit_raw("─ ", &border, state.source.clone(), &node);
+        builder.emphasis = Modifier::BOLD;
         builder.emit_raw(
             &state.language,
             &["ui.text.inactive", "markup.bold"],
             state.source.clone(),
             &node,
         );
+        builder.emphasis = Modifier::empty();
         builder.emit_raw(" ", &border, state.source.clone(), &node);
         let used = UnicodeWidthStr::width(label.as_str());
         builder.emit_raw(
@@ -1365,6 +1390,21 @@ fn expand_tabs(value: &str) -> String {
         }
     }
     result
+}
+
+/// The weight the open tags call for, independent of what the theme happens to
+/// declare for the matching scopes.
+fn active_modifier(tags: &[TagEnd]) -> Modifier {
+    let mut modifier = Modifier::empty();
+    for tag in tags {
+        match tag {
+            TagEnd::Emphasis => modifier |= Modifier::ITALIC,
+            TagEnd::Strong => modifier |= Modifier::BOLD,
+            TagEnd::Strikethrough => modifier |= Modifier::CROSSED_OUT,
+            _ => {}
+        }
+    }
+    modifier
 }
 
 fn active_scopes(tags: &[TagEnd], heading: Option<usize>) -> Vec<String> {
@@ -1728,7 +1768,7 @@ fn raster_math_edit(
 
     let mut reader = ImageReader::new(std::io::Cursor::new(png.as_ref())).with_guessed_format()?;
     reader.limits(media_limits());
-    let image = reader.decode()?.to_rgba8();
+    let image = trim_transparent(&reader.decode()?.to_rgba8());
     let width_limit = render_width.clamp(MIN_WIDTH, MAX_WIDTH) as u32;
 
     if mode == MediaMode::Kitty {
@@ -1761,6 +1801,12 @@ fn raster_math_edit(
     let (target_width, target_height) =
         fit_dimensions(image.width(), image.height(), width_limit, 40);
     anyhow::ensure!(target_width > 0, "raster math has no pixels");
+    // A wide equation squeezed into a pane-width strip loses its glyphs
+    // entirely.  Text beats a smear, so hand back to `terminal_math`.
+    anyhow::ensure!(
+        target_height >= MIN_MATH_PIXEL_ROWS,
+        "formula is too wide to stay legible at this width"
+    );
     let image = imageops::resize(
         &image,
         target_width,
@@ -1837,18 +1883,30 @@ fn cache_math_png(key: String, png: Arc<Vec<u8>>) {
     cache.entries.insert(key, png);
 }
 
+/// The TeX fed to `latex` for one formula.
+///
+/// Display math is wrapped in `$\displaystyle ... $` rather than `\[ ... \]`.
+/// The latter typesets at the full text width, and `tightpage` crops the page
+/// rather than the ink, so the formula would arrive as a sliver in a mostly
+/// blank box — 959x92 for one whose ink is 74x89. `\displaystyle` keeps the
+/// display typesetting, limits above and below included, at its natural width,
+/// which is what leaves enough resolution to survive the downscale.
+fn math_document(formula: &Formula) -> String {
+    let expression = if formula.display {
+        format!("$\\displaystyle {}$", formula.tex)
+    } else {
+        format!("${}$", formula.tex)
+    };
+    format!(
+        "\\documentclass{{article}}\n\\usepackage[active,tightpage]{{preview}}\n\\usepackage{{amsmath,amssymb}}\n\\pagestyle{{empty}}\n\\begin{{document}}\n\\begin{{preview}}\n{expression}\n\\end{{preview}}\n\\end{{document}}\n"
+    )
+}
+
 fn generate_math_png(formula: &Formula, foreground: [u8; 3]) -> anyhow::Result<Vec<u8>> {
     let directory = tempfile::Builder::new()
         .prefix("helix-markdown-math-")
         .tempdir()?;
-    let expression = if formula.display {
-        format!("\\[{}\\]", formula.tex)
-    } else {
-        format!("${}$", formula.tex)
-    };
-    let document = format!(
-        "\\documentclass{{article}}\n\\usepackage[active,tightpage]{{preview}}\n\\usepackage{{amsmath,amssymb}}\n\\pagestyle{{empty}}\n\\begin{{document}}\n\\begin{{preview}}\n{expression}\n\\end{{preview}}\n\\end{{document}}\n"
-    );
+    let document = math_document(formula);
     anyhow::ensure!(
         document.len() <= MAX_TEX_BYTES + 1024,
         "TeX document exceeds limit"
@@ -2227,6 +2285,30 @@ fn bounded_curl_command(url: &str, output: &Path) -> Command {
         .arg(output)
         .arg(url);
     command
+}
+
+/// Crop fully transparent borders.  The ink is what has to survive the
+/// downscale, so padding around it is spent resolution.
+fn trim_transparent(image: &RgbaImage) -> RgbaImage {
+    let opaque = |x: u32, y: u32| image.get_pixel(x, y)[3] != 0;
+    let mut left = image.width();
+    let mut right = 0u32;
+    let mut top = image.height();
+    let mut bottom = 0u32;
+    for y in 0..image.height() {
+        for x in 0..image.width() {
+            if opaque(x, y) {
+                left = left.min(x);
+                right = right.max(x);
+                top = top.min(y);
+                bottom = bottom.max(y);
+            }
+        }
+    }
+    if left > right || top > bottom {
+        return image.clone();
+    }
+    imageops::crop_imm(image, left, top, right - left + 1, bottom - top + 1).to_image()
 }
 
 /// Scale `(width, height)` to fit inside the bounds while preserving the
@@ -2811,6 +2893,39 @@ fn set_view_anchor(cx: &mut Context, anchor: usize) -> bool {
     true
 }
 
+/// Scroll the focused view so its cursor is visible.  Helix scrolls per command
+/// rather than on every selection change, so a selection set from Steel leaves
+/// the viewport where it was; this is the same opt-in the native `goto`
+/// adapters make in `navigation.rs`.  `center` is for deliberate long jumps,
+/// where merely clipping the cursor into view leaves no context around it.
+fn ensure_visible(cx: &mut Context, center: bool) -> bool {
+    let scrolloff = cx.editor.config().scrolloff;
+    let view_id = cx.editor.tree.focus;
+    let doc_id = cx.editor.tree.get(view_id).doc;
+    if !cx.editor.documents.contains_key(&doc_id) {
+        return false;
+    }
+    let (view, doc) = current!(cx.editor);
+    if center {
+        view.ensure_cursor_in_view_center(doc, scrolloff);
+    } else {
+        view.ensure_cursor_in_view(doc, scrolloff);
+    }
+    true
+}
+
+/// Keep the focused buffer even though it is unmodified and pathless, which
+/// `Action::Replace` otherwise reads as "disposable scratch".
+fn pin_focused(cx: &mut Context) -> bool {
+    let view_id = cx.editor.tree.focus;
+    let doc_id = cx.editor.tree.get(view_id).doc;
+    let Some(doc) = cx.editor.documents.get_mut(&doc_id) else {
+        return false;
+    };
+    doc.pinned = true;
+    true
+}
+
 /// Put text straight into the yank register.  The preview's code blocks are
 /// framed, so there is no buffer range that holds the code and nothing else.
 fn copy_text(cx: &mut Context, text: String) -> anyhow::Result<()> {
@@ -2893,6 +3008,8 @@ pub(super) fn register(module: &mut BuiltInModule) {
         .register_fn_with_ctx(CTX, "markdown-render-clear-focused!", clear_focused)
         .register_fn_with_ctx(CTX, "markdown-render-view-anchor", view_anchor)
         .register_fn_with_ctx(CTX, "markdown-render-set-view-anchor!", set_view_anchor)
+        .register_fn_with_ctx(CTX, "markdown-render-ensure-visible!", ensure_visible)
+        .register_fn_with_ctx(CTX, "markdown-preview-pin-focused!", pin_focused)
         .register_fn_with_ctx(CTX, "markdown-preview-copy-text!", copy_text)
         .register_fn_with_ctx(CTX, "markdown-preview-open-target!", open_target)
         .register_fn("markdown-render-formulas", markdown_render_formulas)
@@ -3064,6 +3181,69 @@ mod tests {
         assert_eq!(chunks[1].range, 4..6);
         // `node` is consumed only to keep the builder's counter honest.
         assert!(node.starts_with("code:"));
+    }
+
+    #[test]
+    fn emphasis_carries_a_modifier_of_its_own() {
+        assert_eq!(active_modifier(&[TagEnd::Strong]), Modifier::BOLD);
+        assert_eq!(active_modifier(&[TagEnd::Emphasis]), Modifier::ITALIC);
+        assert_eq!(
+            active_modifier(&[TagEnd::Strong, TagEnd::Emphasis]),
+            Modifier::BOLD | Modifier::ITALIC
+        );
+
+        // The modifier is emitted as a concrete style beside the theme scope,
+        // and carries no colour so the theme keeps owning colour.
+        let mut builder = Builder::new(80);
+        builder.emphasis = Modifier::BOLD;
+        builder.emit_raw("bold", &["markup.bold"], 0..4, "text:0");
+        let concrete: Vec<_> = builder
+            .styles
+            .iter()
+            .filter_map(|span| match &span.style {
+                RenderStyle::Concrete(style) => Some(*style),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(concrete.len(), 1);
+        assert!(concrete[0].add_modifier.contains(Modifier::BOLD));
+        assert!(concrete[0].fg.is_none() && concrete[0].bg.is_none());
+    }
+
+    #[test]
+    fn transparent_margins_are_cropped_away() {
+        // Ink in the middle, fully transparent border all around.
+        let mut image = RgbaImage::from_pixel(10, 6, Rgba([0, 0, 0, 0]));
+        image.put_pixel(4, 2, Rgba([255, 255, 255, 255]));
+        image.put_pixel(5, 3, Rgba([255, 255, 255, 255]));
+        let trimmed = trim_transparent(&image);
+        assert_eq!(trimmed.dimensions(), (2, 2));
+
+        // A fully transparent image has no ink to centre on; leave it alone
+        // rather than returning a zero-sized buffer.
+        let empty = RgbaImage::from_pixel(3, 3, Rgba([0, 0, 0, 0]));
+        assert_eq!(trim_transparent(&empty).dimensions(), (3, 3));
+    }
+
+    #[test]
+    fn display_math_is_typeset_at_its_natural_width() {
+        // `\[ ... \]` fills the text width and `tightpage` crops the page, not
+        // the ink, so the formula would arrive as a sliver of blank paper.
+        let formula = Formula {
+            tex: r"\sum_1^9 x_i".into(),
+            display: true,
+            output: 0..6,
+            source: 0..12,
+        };
+        let document = math_document(&formula);
+        assert!(document.contains(r"$\displaystyle \sum_1^9 x_i$"));
+        assert!(!document.contains(r"\["));
+
+        let inline = Formula {
+            display: false,
+            ..formula
+        };
+        assert!(math_document(&inline).contains(r"$\sum_1^9 x_i$"));
     }
 
     #[test]
