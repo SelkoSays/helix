@@ -18,12 +18,15 @@
          markdown-render-output-for-source
          markdown-render-apply-focused!
          markdown-render-clear-focused!
+         markdown-render-view-anchor
+         markdown-render-set-view-anchor!
+         markdown-preview-copy-text!
          markdown-preview-open-target!)
 
 ;;@doc
 ;; Render Markdown into an opaque native result. `source-path` is a string or
 ;; `#false`; relative targets remain unresolved when it is false. Width is in
-;; terminal cells.
+;; terminal cells. `show-links?` keeps image destinations in the output.
 (define markdown-render helix.markdown-render)
 
 ;;@doc
@@ -70,6 +73,14 @@
 ;; is byte-for-byte the render's output text.
 (define markdown-render-apply-focused! helix.markdown-render-apply-focused!)
 (define markdown-render-clear-focused! helix.markdown-render-clear-focused!)
+
+;; Read and restore the focused view's scroll anchor, so a re-rendered preview
+;; can be put back exactly where the reader left it.
+(define markdown-render-view-anchor helix.markdown-render-view-anchor)
+(define markdown-render-set-view-anchor! helix.markdown-render-set-view-anchor!)
+
+;; Write a string to the default yank register.
+(define markdown-preview-copy-text! helix.markdown-preview-copy-text!)
 
 ;; Open HTTP(S)/mailto externally or an absolute local target through Helix.
 ;; Internal anchors return false. Unknown schemes are rejected.

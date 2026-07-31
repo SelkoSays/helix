@@ -49,9 +49,19 @@ const MAX_REMOTE_MEDIA: usize = 8;
 const MAX_TEX_BYTES: usize = 16 * 1024;
 const MAX_TEX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MATH_CACHE_BYTES: usize = 32 * 1024 * 1024;
-const MAX_KITTY_COLUMNS: u32 = 64;
-const MAX_KITTY_ROWS: u32 = 64;
+// Unicode-placeholder cells are addressed by the diacritic table, so neither
+// dimension can exceed its length.
+const MAX_KITTY_COLUMNS: u32 = KITTY_DIACRITICS.len() as u32;
+const MAX_KITTY_ROWS: u32 = KITTY_DIACRITICS.len() as u32;
+/// Terminal cell height divided by cell width.  The terminal never reports its
+/// cell size to us, so Kitty placements assume the near-universal 1:2 cell;
+/// being wrong here skews proportions but cannot overflow the placement.
+const CELL_ASPECT: f32 = 2.0;
+const ASSUMED_CELL_WIDTH: u32 = 8;
+const ASSUMED_CELL_HEIGHT: u32 = 16;
 const KITTY_PLACEHOLDER: char = '\u{10eeee}';
+/// Indentation alone reads poorly once lists nest; vary the marker by depth.
+const BULLETS: [char; 5] = ['•', '◦', '▪', '‣', '⁃'];
 const KITTY_DIACRITICS: [char; 64] = [
     '\u{0305}', '\u{030d}', '\u{030e}', '\u{0310}', '\u{0312}', '\u{033d}', '\u{033e}', '\u{033f}',
     '\u{0346}', '\u{034a}', '\u{034b}', '\u{034c}', '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}',
@@ -241,6 +251,10 @@ struct Builder {
     text: String,
     width: usize,
     column: usize,
+    /// Inline runs arrive as separate events, so the whitespace that separates
+    /// them belongs to neither run.  Carry it between emissions instead of
+    /// deriving it per call, or `a *b* c` collapses to `abc`.
+    pending_space: bool,
     styles: Vec<StyledRange>,
     mappings: Vec<SourceMap>,
     anchors: HashMap<String, usize>,
@@ -260,6 +274,7 @@ impl Builder {
             text: String::new(),
             width: width.clamp(MIN_WIDTH, MAX_WIDTH),
             column: 0,
+            pending_space: false,
             styles: Vec::new(),
             mappings: Vec::new(),
             anchors: HashMap::new(),
@@ -287,6 +302,7 @@ impl Builder {
             self.text.push('\n');
         }
         self.column = 0;
+        self.pending_space = false;
     }
 
     fn blank_line(&mut self) {
@@ -295,6 +311,7 @@ impl Builder {
             self.text.push('\n');
         }
         self.column = 0;
+        self.pending_space = false;
     }
 
     fn emit_raw(
@@ -331,6 +348,27 @@ impl Builder {
         start..end
     }
 
+    /// Emit inline content that participates in inter-run spacing.  Block
+    /// furniture (bullets, borders, quote prefixes) must keep using `emit_raw`,
+    /// which drops any pending space rather than materializing it.
+    fn emit_inline(
+        &mut self,
+        value: &str,
+        scopes: &[&str],
+        source: Range<usize>,
+        node: &str,
+    ) -> Range<usize> {
+        self.flush_pending_space(scopes, source.clone(), node);
+        self.emit_raw(value, scopes, source, node)
+    }
+
+    fn flush_pending_space(&mut self, scopes: &[&str], source: Range<usize>, node: &str) {
+        if self.pending_space && !self.at_line_start() {
+            self.emit_raw(" ", scopes, source, node);
+        }
+        self.pending_space = false;
+    }
+
     fn emit_wrapped(
         &mut self,
         value: &str,
@@ -339,11 +377,17 @@ impl Builder {
         node: &str,
         prefix: &str,
     ) -> Range<usize> {
-        let start = self.char_len();
+        let value = sanitize_controls(value);
+        if value.starts_with(char::is_whitespace) {
+            self.pending_space = true;
+        }
+        // Separators belong to the gap, not to the run, so the reported range
+        // opens at the first real word.
+        let mut start = self.char_len();
         let mut first = true;
-        for word in sanitize_controls(value).split_whitespace() {
+        for word in value.split_whitespace() {
             let word_width = UnicodeWidthStr::width(word);
-            let separator = usize::from(!first && !self.at_line_start());
+            let separator = usize::from((self.pending_space || !first) && !self.at_line_start());
             if self.column + separator + word_width > self.width && !self.at_line_start() {
                 self.newline();
                 if !prefix.is_empty() {
@@ -352,8 +396,15 @@ impl Builder {
             } else if separator == 1 {
                 self.emit_raw(" ", scopes, source.clone(), node);
             }
+            self.pending_space = false;
+            if first {
+                start = self.char_len();
+            }
             self.emit_raw(word, scopes, source.clone(), node);
             first = false;
+        }
+        if value.ends_with(char::is_whitespace) {
+            self.pending_space = true;
         }
         start..self.char_len()
     }
@@ -409,6 +460,7 @@ fn render(
     source: String,
     source_path: Option<String>,
     width: usize,
+    show_links: bool,
 ) -> SteelMarkdownRender {
     let mut options = Options::ENABLE_GFM;
     options.insert(Options::ENABLE_TABLES);
@@ -426,6 +478,9 @@ fn render(
     let mut code: Option<NativeCodeState> = None;
     let mut table: Option<TableState> = None;
     let mut quote_depth = 0usize;
+    // Block HTML arrives one line per event, so an unterminated comment has to
+    // stay open across events.
+    let mut html_comment = false;
     let mut footnote_definitions = Vec::new();
     let mut footnote_references: HashMap<String, usize> = HashMap::new();
 
@@ -474,8 +529,28 @@ fn render(
                     }
                     Tag::Heading { level, .. } => {
                         builder.blank_line();
+                        let level = heading_level(level);
+                        let node = builder.node("heading");
+                        let scope = format!("markup.heading.{level}");
+                        if level == 1 {
+                            builder.emit_raw(
+                                &heading_rule(builder.width, '━'),
+                                &[scope.as_str()],
+                                source_range.clone(),
+                                &node,
+                            );
+                            builder.newline();
+                            builder.emit_raw(" ", &[scope.as_str()], source_range.clone(), &node);
+                        } else if let Some(prefix) = heading_prefix(level) {
+                            builder.emit_raw(
+                                prefix,
+                                &[scope.as_str()],
+                                source_range.clone(),
+                                &node,
+                            );
+                        }
                         heading = Some(HeadingState {
-                            level: heading_level(level),
+                            level,
                             title: String::new(),
                             output: builder.char_len(),
                             source: source_range.clone(),
@@ -522,7 +597,10 @@ fn render(
                                 *number += 1;
                                 (bullet, "markup.list.numbered")
                             }
-                            _ => ("• ".to_string(), "markup.list.unnumbered"),
+                            _ => (
+                                format!("{} ", BULLETS[depth % BULLETS.len()]),
+                                "markup.list.unnumbered",
+                            ),
                         };
                         let node = builder.node("item");
                         builder.emit_raw(
@@ -590,6 +668,33 @@ fn render(
                     TagEnd::Heading(_) => {
                         if let Some(mut state) = heading.take() {
                             state.source.end = source_range.end;
+                            // `column` is the display width of the title's last
+                            // line, which is what the underline should match.
+                            let title_width = builder.column;
+                            let node = builder.node("heading-rule");
+                            let scope = format!("markup.heading.{}", state.level);
+                            match state.level {
+                                1 => {
+                                    builder.newline();
+                                    builder.emit_raw(
+                                        &heading_rule(builder.width, '━'),
+                                        &[scope.as_str()],
+                                        state.source.clone(),
+                                        &node,
+                                    );
+                                }
+                                2 => {
+                                    builder.newline();
+                                    let width = title_width.clamp(3, builder.width);
+                                    builder.emit_raw(
+                                        &"─".repeat(width),
+                                        &[scope.as_str()],
+                                        state.source.clone(),
+                                        &node,
+                                    );
+                                }
+                                _ => {}
+                            }
                             let anchor = builder.unique_anchor(&state.title);
                             builder.headings.push(Heading {
                                 level: state.level,
@@ -664,6 +769,11 @@ fn render(
                         if let Some(mut state) = image.take() {
                             state.source.end = source_range.end;
                             let node = builder.node("image");
+                            builder.flush_pending_space(
+                                &["markup.link.url"],
+                                state.source.clone(),
+                                &node,
+                            );
                             let start = builder.char_len();
                             let alt = if state.alt.trim().is_empty() {
                                 "image"
@@ -683,19 +793,21 @@ fn render(
                                 &node,
                                 "",
                             );
-                            builder.emit_raw(
-                                " — ",
-                                &["ui.text.inactive"],
-                                state.source.clone(),
-                                &node,
-                            );
-                            builder.emit_wrapped(
-                                &state.destination,
-                                &["markup.link.url"],
-                                state.source.clone(),
-                                &node,
-                                "  ",
-                            );
+                            if show_links {
+                                builder.emit_raw(
+                                    " — ",
+                                    &["ui.text.inactive"],
+                                    state.source.clone(),
+                                    &node,
+                                );
+                                builder.emit_wrapped(
+                                    &state.destination,
+                                    &["markup.link.url"],
+                                    state.source.clone(),
+                                    &node,
+                                    "  ",
+                                );
+                            }
                             builder.emit_raw(
                                 if state.remote {
                                     " [remote blocked]"
@@ -752,12 +864,12 @@ fn render(
                     state.label.push_str(&text);
                 }
                 let node = builder.node("inline-code");
-                builder.emit_raw(&text, &["markup.raw.inline"], source_range, &node);
+                builder.emit_inline(&text, &["markup.raw.inline"], source_range, &node);
             }
             Event::InlineMath(math) => {
                 let rendered = terminal_math(&math);
                 let node = builder.node("inline-math");
-                let output = builder.emit_raw(
+                let output = builder.emit_inline(
                     &rendered,
                     &["markup.raw.inline"],
                     source_range.clone(),
@@ -800,14 +912,14 @@ fn render(
                 builder.blank_line();
             }
             Event::Html(html) | Event::InlineHtml(html) => {
+                let (text, breaks) = strip_html(&html, &mut html_comment);
                 let node = builder.node("html");
-                builder.emit_wrapped(
-                    &escape_html(&html),
-                    &["ui.text.inactive"],
-                    source_range,
-                    &node,
-                    "",
-                );
+                if !text.trim().is_empty() {
+                    builder.emit_wrapped(&text, &["ui.text"], source_range, &node, "");
+                }
+                for _ in 0..breaks {
+                    builder.newline();
+                }
             }
             Event::FootnoteReference(label) => {
                 let node = builder.node("footnote-reference");
@@ -819,7 +931,7 @@ fn render(
                 };
                 *count += 1;
                 builder.anchors.insert(anchor, builder.char_len());
-                let output = builder.emit_raw(
+                let output = builder.emit_inline(
                     &format!("[^{label}]"),
                     &["markup.link.label"],
                     source_range.clone(),
@@ -833,10 +945,9 @@ fn render(
                     source: source_range,
                 });
             }
-            Event::SoftBreak => {
-                let node = builder.node("soft-break");
-                builder.emit_raw(" ", &[], source_range, &node);
-            }
+            // A soft break is a separator, not content: deferring it keeps the
+            // wrap decision with the next word and avoids a zero-width mapping.
+            Event::SoftBreak => builder.pending_space = true,
             Event::HardBreak => builder.newline(),
             Event::Rule => {
                 builder.blank_line();
@@ -872,8 +983,14 @@ fn capture_table_event(table: &mut TableState, event: &Event<'_>, source: Range<
     table.source.end = source.end;
     match event {
         Event::Start(Tag::TableHead) => table.in_head = true,
+        // pulldown-cmark reports header cells directly inside `TableHead` with
+        // no enclosing `TableRow`, so the header has to be committed here or
+        // the first body row's `Start(TableRow)` discards it.
         Event::End(TagEnd::TableHead) => {
             table.in_head = false;
+            if !table.row.is_empty() {
+                table.rows.push(std::mem::take(&mut table.row));
+            }
             table.header_rows = table.rows.len();
         }
         Event::Start(Tag::TableRow) => table.row = Vec::new(),
@@ -884,11 +1001,10 @@ fn capture_table_event(table: &mut TableState, event: &Event<'_>, source: Range<
                 table.row.push(cell);
             }
         }
+        // Adjacent inline runs carry their own spacing; inserting one here turns
+        // `**a**b` into `a b`.
         Event::Text(text) | Event::Code(text) | Event::InlineMath(text) => {
             if let Some(cell) = table.cell.as_mut() {
-                if !cell.text.is_empty() {
-                    cell.text.push(' ');
-                }
                 cell.text.push_str(text);
             }
         }
@@ -932,7 +1048,7 @@ fn render_table(builder: &mut Builder, table: TableState) {
         widths[column] -= 1;
     }
     let node = builder.node("table");
-    table_border(builder, '┌', '┬', '┐', &widths, table.source.clone(), &node);
+    table_border(builder, TABLE_TOP, &widths, table.source.clone(), &node);
     for (row_index, row) in table.rows.iter().enumerate() {
         let wrapped = (0..columns)
             .map(|column| {
@@ -956,7 +1072,7 @@ fn render_table(builder: &mut Builder, table: TableState) {
                         .copied()
                         .unwrap_or(Alignment::None),
                 );
-                let scope = if row_index < table.header_rows.max(1) {
+                let scope = if row_index < table.header_rows {
                     "markup.heading"
                 } else {
                     "ui.text"
@@ -967,26 +1083,34 @@ fn render_table(builder: &mut Builder, table: TableState) {
             }
             builder.newline();
         }
-        if row_index + 1 < table.rows.len() {
-            table_border(builder, '├', '┼', '┤', &widths, table.source.clone(), &node);
+        // Only the header earns a divider.  A rule between every body row
+        // buries the data it is supposed to separate.
+        if table.header_rows > 0 && row_index + 1 == table.header_rows {
+            table_border(builder, TABLE_HEADER, &widths, table.source.clone(), &node);
         }
     }
-    table_border(builder, '└', '┴', '┘', &widths, table.source, &node);
+    table_border(builder, TABLE_BOTTOM, &widths, table.source, &node);
 }
+
+/// `[left, middle, right, fill]` corner and run glyphs for one table rule.
+type BorderGlyphs = [char; 4];
+
+const TABLE_TOP: BorderGlyphs = ['┌', '┬', '┐', '─'];
+const TABLE_HEADER: BorderGlyphs = ['╞', '╪', '╡', '═'];
+const TABLE_BOTTOM: BorderGlyphs = ['└', '┴', '┘', '─'];
 
 fn table_border(
     builder: &mut Builder,
-    left: char,
-    middle: char,
-    right: char,
+    glyphs: BorderGlyphs,
     widths: &[usize],
     source: Range<usize>,
     node: &str,
 ) {
+    let [left, middle, right, fill] = glyphs;
     let mut border = String::new();
     border.push(left);
     for (index, width) in widths.iter().enumerate() {
-        border.push_str(&"─".repeat(*width + 2));
+        border.push_str(&fill.to_string().repeat(*width + 2));
         border.push(if index + 1 == widths.len() {
             right
         } else {
@@ -1043,29 +1167,111 @@ fn align_cell(value: &str, width: usize, alignment: Alignment) -> String {
     format!("{}{}{}", " ".repeat(left), value, " ".repeat(right))
 }
 
+/// One run of code characters that made it into the output contiguously.
+/// Framing splits the code across lines, so highlight offsets have to be
+/// translated through these rather than added to a single block start.
+struct CodeSegment {
+    code: Range<usize>,
+    output: usize,
+}
+
 fn render_code(cx: &mut Context, builder: &mut Builder, state: NativeCodeState) {
     let node = builder.node("code");
-    if !state.language.is_empty() {
+    // Tabs would misalign the right border, and tree-sitter is indifferent to
+    // the substitution, so highlight the expanded text too.
+    let code = expand_tabs(&state.code);
+    let lines = code.strip_suffix('\n').unwrap_or(&code);
+    let lines = lines.split('\n').collect::<Vec<_>>();
+
+    let label = if state.language.is_empty() {
+        String::new()
+    } else {
+        format!("─ {} ", state.language)
+    };
+    let frame_budget = builder.width.saturating_sub(4).max(1);
+    let inner = lines
+        .iter()
+        .map(|line| UnicodeWidthStr::width(*line))
+        .max()
+        .unwrap_or(0)
+        .max(UnicodeWidthStr::width(label.as_str()))
+        .clamp(1, frame_budget);
+
+    let start = builder.char_len();
+    let border = ["ui.text.inactive"];
+    // A language too long for the frame would push the top border past the
+    // sides; drop the header rather than draw a ragged box.
+    let show_label =
+        !state.language.is_empty() && UnicodeWidthStr::width(label.as_str()) <= inner + 2;
+
+    // Top border, with the language sitting in it as the box header.
+    builder.emit_raw("╭", &border, state.source.clone(), &node);
+    if !show_label {
+        builder.emit_raw(&"─".repeat(inner + 2), &border, state.source.clone(), &node);
+    } else {
+        builder.emit_raw("─ ", &border, state.source.clone(), &node);
         builder.emit_raw(
-            &format!(" {} ", state.language),
+            &state.language,
             &["ui.text.inactive", "markup.bold"],
             state.source.clone(),
             &node,
         );
-        builder.newline();
+        builder.emit_raw(" ", &border, state.source.clone(), &node);
+        let used = UnicodeWidthStr::width(label.as_str());
+        builder.emit_raw(
+            &"─".repeat((inner + 2).saturating_sub(used)),
+            &border,
+            state.source.clone(),
+            &node,
+        );
     }
-    let output = builder.emit_raw(
-        &state.code,
-        &["markup.raw.block"],
+    builder.emit_raw("╮", &border, state.source.clone(), &node);
+    builder.newline();
+
+    let mut segments = Vec::new();
+    let mut consumed = 0usize;
+    for line in &lines {
+        let line_start = consumed;
+        consumed += line.chars().count() + 1; // include the newline we dropped
+        for chunk in wrap_code_line(line, inner) {
+            builder.emit_raw("│ ", &border, state.source.clone(), &node);
+            let output = builder.char_len();
+            builder.emit_raw(
+                &chunk.text,
+                &["markup.raw.block"],
+                state.source.clone(),
+                &node,
+            );
+            segments.push(CodeSegment {
+                code: line_start + chunk.range.start..line_start + chunk.range.end,
+                output,
+            });
+            let padding = inner.saturating_sub(UnicodeWidthStr::width(chunk.text.as_str()));
+            builder.emit_raw(
+                &format!("{} │", " ".repeat(padding)),
+                &border,
+                state.source.clone(),
+                &node,
+            );
+            builder.newline();
+        }
+    }
+
+    builder.emit_raw(
+        &format!("╰{}╯", "─".repeat(inner + 2)),
+        &border,
         state.source.clone(),
         &node,
     );
+    builder.newline();
+    let output = start..builder.char_len();
+
     if !state.language.is_empty() {
-        for span in syntax_highlight::spans(cx, &state.code, &state.language) {
+        for span in syntax_highlight::spans(cx, &code, &state.language) {
             let SteelVal::ListV(fields) = span else {
                 continue;
             };
-            let (Some(start), Some(end), Some(style)) = (
+            let (Some(span_start), Some(span_end), Some(style)) = (
                 steel_integer(fields.get(0)),
                 steel_integer(fields.get(1)),
                 fields
@@ -1075,20 +1281,90 @@ fn render_code(cx: &mut Context, builder: &mut Builder, state: NativeCodeState) 
             ) else {
                 continue;
             };
-            if start < end && output.start + end <= output.end {
+            if span_start >= span_end {
+                continue;
+            }
+            for segment in &segments {
+                let from = span_start.max(segment.code.start);
+                let to = span_end.min(segment.code.end);
+                if from >= to {
+                    continue;
+                }
+                let offset = segment.output + (from - segment.code.start);
                 builder.styles.push(StyledRange {
-                    range: output.start + start..output.start + end,
+                    range: offset..offset + (to - from),
                     style: RenderStyle::Concrete(style),
                 });
             }
         }
     }
+
     builder.code_blocks.push(CodeBlock {
         language: state.language,
+        // The exact original text, so copying a block is byte-faithful.
         code: state.code,
         output,
         source: state.source,
     });
+}
+
+struct CodeChunk {
+    text: String,
+    range: Range<usize>,
+}
+
+/// Split one code line into pieces that fit the frame.  Code is not prose, so
+/// break on width rather than on words.
+fn wrap_code_line(line: &str, width: usize) -> Vec<CodeChunk> {
+    let mut chunks = Vec::new();
+    let mut text = String::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    let mut used = 0usize;
+
+    for ch in line.chars() {
+        let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
+        if used + ch_width > width && !text.is_empty() {
+            chunks.push(CodeChunk {
+                text: std::mem::take(&mut text),
+                range: start..index,
+            });
+            start = index;
+            used = 0;
+        }
+        text.push(ch);
+        used += ch_width;
+        index += 1;
+    }
+    chunks.push(CodeChunk {
+        text,
+        range: start..index,
+    });
+    chunks
+}
+
+fn expand_tabs(value: &str) -> String {
+    const TAB: usize = 4;
+    let mut result = String::with_capacity(value.len());
+    let mut column = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '\t' => {
+                let advance = TAB - column % TAB;
+                result.push_str(&" ".repeat(advance));
+                column += advance;
+            }
+            '\n' => {
+                result.push('\n');
+                column = 0;
+            }
+            ch => {
+                result.push(ch);
+                column += UnicodeWidthStr::width(ch.to_string().as_str());
+            }
+        }
+    }
+    result
 }
 
 fn active_scopes(tags: &[TagEnd], heading: Option<usize>) -> Vec<String> {
@@ -1115,6 +1391,22 @@ fn callout(kind: BlockQuoteKind) -> (&'static str, &'static str) {
         BlockQuoteKind::Important => ("IMPORTANT", "diagnostic.info"),
         BlockQuoteKind::Warning => ("WARNING", "diagnostic.warning"),
         BlockQuoteKind::Caution => ("CAUTION", "diagnostic.error"),
+    }
+}
+
+fn heading_rule(width: usize, fill: char) -> String {
+    fill.to_string().repeat(width.min(72))
+}
+
+/// Levels 1 and 2 are drawn with rules; the rest need a marker to stay
+/// distinguishable when a theme gives them the same colour.
+fn heading_prefix(level: usize) -> Option<&'static str> {
+    match level {
+        1 | 2 => None,
+        3 => Some("▸ "),
+        4 => Some("  ‣ "),
+        5 => Some("    · "),
+        _ => Some("      · "),
     }
 }
 
@@ -1146,11 +1438,63 @@ fn sanitize_controls(value: &str) -> String {
         .collect()
 }
 
-fn escape_html(value: &str) -> String {
-    sanitize_controls(value)
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+/// Reduce raw HTML to the text a reader cares about: comments disappear, `<br>`
+/// becomes a line break, and every other tag is dropped while its content
+/// survives.  Escaping instead of stripping is what put a literal
+/// `&lt;!-- ... --&gt;` on screen.
+///
+/// `in_comment` carries an unterminated comment across events, since block HTML
+/// is reported one line at a time.  Returns the visible text and the number of
+/// explicit line breaks the markup asked for.
+fn strip_html(value: &str, in_comment: &mut bool) -> (String, usize) {
+    let value = sanitize_controls(value);
+    let mut text = String::new();
+    let mut breaks = 0usize;
+    let mut rest = value.as_str();
+
+    loop {
+        if *in_comment {
+            match rest.find("-->") {
+                Some(index) => {
+                    *in_comment = false;
+                    rest = &rest[index + 3..];
+                }
+                None => break,
+            }
+            continue;
+        }
+        let Some(index) = rest.find('<') else {
+            text.push_str(rest);
+            break;
+        };
+        text.push_str(&rest[..index]);
+        rest = &rest[index..];
+
+        if rest.starts_with("<!--") {
+            *in_comment = true;
+            rest = &rest[4..];
+            continue;
+        }
+        // A `<` with no closing `>` in this event is literal text, not a tag.
+        let Some(end) = rest.find('>') else {
+            text.push_str(rest);
+            break;
+        };
+        let tag = rest[1..end].trim().trim_end_matches('/').trim();
+        let name = tag
+            .strip_prefix('/')
+            .unwrap_or(tag)
+            .split(|ch: char| ch.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if name == "br" {
+            breaks += 1;
+        }
+        rest = &rest[end + 1..];
+    }
+
+    (text, breaks)
 }
 
 fn slug(value: &str) -> String {
@@ -1267,13 +1611,16 @@ fn has_scheme(value: &str) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_local_media(
     render: SteelMarkdownRender,
     mode: MediaMode,
     background: [u8; 3],
+    foreground: [u8; 3],
     true_color: bool,
     allow_remote: bool,
     raster_math: bool,
+    show_links: bool,
 ) -> SteelMarkdownRender {
     let mut edits = Vec::new();
     let kitty_available = tui::backend::kitty_graphics_available();
@@ -1289,9 +1636,14 @@ fn render_local_media(
     };
     if raster_math {
         for formula in &render.0.formulas {
-            if let Ok(edit) =
-                raster_math_edit(formula, render.0.width, math_mode, background, true_color)
-            {
+            if let Ok(edit) = raster_math_edit(
+                formula,
+                render.0.width,
+                math_mode,
+                background,
+                foreground,
+                true_color,
+            ) {
                 edits.push(edit);
             }
         }
@@ -1306,18 +1658,37 @@ fn render_local_media(
                 continue;
             }
             if remote_count >= MAX_REMOTE_MEDIA {
-                Ok(media_status_edit(media, "remote item limit exceeded", None))
+                Ok(media_status_edit(
+                    media,
+                    "remote item limit exceeded",
+                    None,
+                    show_links,
+                ))
             } else {
                 remote_count += 1;
-                fetch_remote_media_edit(media, render.0.width, media_mode, background, true_color)
+                fetch_remote_media_edit(
+                    media,
+                    render.0.width,
+                    media_mode,
+                    background,
+                    true_color,
+                    show_links,
+                )
             }
         } else if !has_scheme(&media.destination) {
-            decode_media_edit(media, render.0.width, media_mode, background, true_color)
+            decode_media_edit(
+                media,
+                render.0.width,
+                media_mode,
+                background,
+                true_color,
+                show_links,
+            )
         } else {
             continue;
         };
         edits.push(result.unwrap_or_else(|error| {
-            media_status_edit(media, &format!("media failed: {error}"), None)
+            media_status_edit(media, &format!("media failed: {error}"), None, show_links)
         }));
     }
     SteelMarkdownRender(Arc::new(apply_media_edits(render.0.as_ref(), edits)))
@@ -1328,16 +1699,27 @@ fn raster_math_edit(
     render_width: usize,
     mode: MediaMode,
     background: [u8; 3],
+    foreground: [u8; 3],
     true_color: bool,
 ) -> anyhow::Result<MediaEdit> {
     anyhow::ensure!(
         formula.tex.len() <= MAX_TEX_BYTES,
         "formula exceeds TeX byte limit"
     );
-    let key = format!("{}:{}", formula.display, formula.tex);
+    // An inline half-block run has exactly one cell of vertical room, so
+    // anything taller would spill across the line it sits in.  One cell of
+    // glyph is unreadable, so leave inline formulas as terminal text and let
+    // Kitty — which scales inside the cell — handle them instead.
+    anyhow::ensure!(
+        formula.display || mode == MediaMode::Kitty,
+        "inline math stays textual outside Kitty"
+    );
+
+    // The ink colour is baked into the PNG, so it belongs in the cache key.
+    let key = format!("{}:{:?}:{}", formula.display, foreground, formula.tex);
     let png = cached_math_png(&key).unwrap_or_else(|| Arc::new(Vec::new()));
     let png = if png.is_empty() {
-        let generated = Arc::new(generate_math_png(formula)?);
+        let generated = Arc::new(generate_math_png(formula, foreground)?);
         cache_math_png(key, generated.clone());
         generated
     } else {
@@ -1347,23 +1729,46 @@ fn raster_math_edit(
     let mut reader = ImageReader::new(std::io::Cursor::new(png.as_ref())).with_guessed_format()?;
     reader.limits(media_limits());
     let image = reader.decode()?.to_rgba8();
-    let max_height = if formula.display { 40 } else { 2 };
-    let image = imageops::thumbnail(
-        &image,
-        render_width.clamp(MIN_WIDTH, MAX_WIDTH) as u32,
-        max_height,
-    );
-    let cells = image.width() as usize * image.height().div_ceil(2) as usize;
-    anyhow::ensure!(cells <= MAX_MEDIA_CELLS, "raster math exceeds cell limit");
+    let width_limit = render_width.clamp(MIN_WIDTH, MAX_WIDTH) as u32;
 
     if mode == MediaMode::Kitty {
+        let max_rows = if formula.display { 20 } else { 1 };
+        let (columns, rows) = kitty_cells(
+            image.width(),
+            image.height(),
+            width_limit.min(MAX_KITTY_COLUMNS),
+            max_rows,
+        );
+        anyhow::ensure!(columns > 0 && rows > 0, "raster math has no cells");
+        let image = imageops::resize(
+            &image,
+            columns * ASSUMED_CELL_WIDTH,
+            rows * ASSUMED_CELL_HEIGHT,
+            imageops::FilterType::Lanczos3,
+        );
         return kitty_image_edit(
             formula.output.clone(),
             &image,
+            columns,
+            rows,
             String::new(),
             formula.display,
         );
     }
+
+    // Display math: half-block pixels are square on a 1:2 cell, so the pixel
+    // grid keeps the source aspect directly.
+    let (target_width, target_height) =
+        fit_dimensions(image.width(), image.height(), width_limit, 40);
+    anyhow::ensure!(target_width > 0, "raster math has no pixels");
+    let image = imageops::resize(
+        &image,
+        target_width,
+        target_height,
+        imageops::FilterType::Lanczos3,
+    );
+    let cells = image.width() as usize * image.height().div_ceil(2) as usize;
+    anyhow::ensure!(cells <= MAX_MEDIA_CELLS, "raster math exceeds cell limit");
 
     let mut text = String::new();
     let mut styles = Vec::with_capacity(cells);
@@ -1432,7 +1837,7 @@ fn cache_math_png(key: String, png: Arc<Vec<u8>>) {
     cache.entries.insert(key, png);
 }
 
-fn generate_math_png(formula: &Formula) -> anyhow::Result<Vec<u8>> {
+fn generate_math_png(formula: &Formula, foreground: [u8; 3]) -> anyhow::Result<Vec<u8>> {
     let directory = tempfile::Builder::new()
         .prefix("helix-markdown-math-")
         .tempdir()?;
@@ -1468,6 +1873,16 @@ fn generate_math_png(formula: &Formula) -> anyhow::Result<Vec<u8>> {
         "TeX artifacts exceed output limit"
     );
 
+    // Render well above the target size and downscale: the glyph strokes only
+    // survive half-block quantization if they start out oversampled.  LaTeX ink
+    // is black, which is invisible on a dark theme, so paint it in the theme's
+    // own foreground instead.
+    let ink = format!(
+        "rgb {:.3} {:.3} {:.3}",
+        f32::from(foreground[0]) / 255.0,
+        f32::from(foreground[1]) / 255.0,
+        f32::from(foreground[2]) / 255.0
+    );
     let dvipng = bounded_process(
         "dvipng",
         directory.path(),
@@ -1475,9 +1890,11 @@ fn generate_math_png(formula: &Formula) -> anyhow::Result<Vec<u8>> {
             "-T",
             "tight",
             "-D",
-            "130",
+            "200",
             "-bg",
             "Transparent",
+            "-fg",
+            ink.as_str(),
             "-o",
             "formula.png",
             "formula.dvi",
@@ -1526,6 +1943,7 @@ fn decode_media_edit(
     mode: MediaMode,
     background: [u8; 3],
     true_color: bool,
+    show_links: bool,
 ) -> anyhow::Result<MediaEdit> {
     let path = PathBuf::from(
         media
@@ -1534,7 +1952,15 @@ fn decode_media_edit(
             .map(|(path, _)| path)
             .unwrap_or(&media.destination),
     );
-    decode_media_edit_from_path(media, &path, render_width, mode, background, true_color)
+    decode_media_edit_from_path(
+        media,
+        &path,
+        render_width,
+        mode,
+        background,
+        true_color,
+        show_links,
+    )
 }
 
 fn decode_media_edit_from_path(
@@ -1544,12 +1970,13 @@ fn decode_media_edit_from_path(
     mode: MediaMode,
     background: [u8; 3],
     true_color: bool,
+    show_links: bool,
 ) -> anyhow::Result<MediaEdit> {
     if path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
     {
-        return Ok(media_status_edit(media, "SVG; external", None));
+        return Ok(media_status_edit(media, "SVG; external", None, show_links));
     }
     let size = fs::metadata(&path)?.len();
     anyhow::ensure!(size <= MAX_MEDIA_BYTES, "compressed file exceeds 12 MiB");
@@ -1562,52 +1989,77 @@ fn decode_media_edit_from_path(
         "decoded image exceeds pixel limit"
     );
     if mode == MediaMode::External {
-        return Ok(media_status_edit(media, "external", Some((width, height))));
+        return Ok(media_status_edit(
+            media,
+            "external",
+            Some((width, height)),
+            show_links,
+        ));
     }
 
     let mut reader = ImageReader::open(&path)?.with_guessed_format()?;
     reader.limits(media_limits());
     let image = reader.decode()?.to_rgba8();
-    let max_width = if mode == MediaMode::Kitty {
-        (render_width.clamp(MIN_WIDTH, MAX_WIDTH) as u32).min(MAX_KITTY_COLUMNS)
-    } else {
-        render_width.clamp(MIN_WIDTH, MAX_WIDTH) as u32
-    };
-    let max_pixel_height = if mode == MediaMode::Kitty {
-        MAX_KITTY_ROWS * 2
-    } else {
-        (MAX_MEDIA_HEIGHT_CELLS * 2) as u32
-    };
-    let image = imageops::thumbnail(&image, max_width, max_pixel_height);
+    let width_limit = render_width.clamp(MIN_WIDTH, MAX_WIDTH) as u32;
+
+    if mode == MediaMode::Kitty {
+        let (columns, rows) = kitty_cells(
+            image.width(),
+            image.height(),
+            width_limit.min(MAX_KITTY_COLUMNS),
+            MAX_KITTY_ROWS,
+        );
+        let fallback = || {
+            Ok(media_status_edit(
+                media,
+                "Kitty upload unavailable; external",
+                Some((width, height)),
+                show_links,
+            ))
+        };
+        if columns == 0 || rows == 0 {
+            return fallback();
+        }
+        let image = imageops::resize(
+            &image,
+            columns * ASSUMED_CELL_WIDTH,
+            rows * ASSUMED_CELL_HEIGHT,
+            imageops::FilterType::Lanczos3,
+        );
+        let header = media_header(media, width, height, "kitty", show_links);
+        return kitty_image_edit(media.output.clone(), &image, columns, rows, header, true)
+            .or_else(|_| fallback());
+    }
+
+    // Half-block pixels are square on a 1:2 cell, so fitting the pixel grid to
+    // the pane preserves the image's own proportions.
+    let (target_width, target_height) = fit_dimensions(
+        image.width(),
+        image.height(),
+        width_limit,
+        (MAX_MEDIA_HEIGHT_CELLS * 2) as u32,
+    );
+    anyhow::ensure!(target_width > 0, "image has no pixels");
+    let image = imageops::resize(
+        &image,
+        target_width,
+        target_height,
+        imageops::FilterType::Lanczos3,
+    );
     let cells = image.width() as usize * image.height().div_ceil(2) as usize;
     anyhow::ensure!(
         cells <= MAX_MEDIA_CELLS,
         "rendered image exceeds cell limit"
     );
 
-    if mode == MediaMode::Kitty {
-        let header = format!(
-            "🖼 {} — {} [{}×{}; kitty]\n",
-            media.alt, media.destination, width, height
-        );
-        return kitty_image_edit(media.output.clone(), &image, header, true).or_else(|_| {
-            Ok(media_status_edit(
-                media,
-                "Kitty upload unavailable; external",
-                Some((width, height)),
-            ))
+    let mut text = media_header(media, width, height, "unicode", show_links);
+    let mut styles = Vec::with_capacity(cells + 1);
+    if !text.is_empty() {
+        styles.push(StyledRange {
+            range: 0..text.chars().count(),
+            style: RenderStyle::Scope("ui.text.inactive".to_string()),
         });
     }
-
-    let mut text = format!(
-        "🖼 {} — {} [{}×{}; unicode]\n",
-        media.alt, media.destination, width, height
-    );
-    let mut styles = Vec::with_capacity(cells + 1);
-    styles.push(StyledRange {
-        range: 0..text.chars().count(),
-        style: RenderStyle::Scope("ui.text.inactive".to_string()),
-    });
     for y in (0..image.height()).step_by(2) {
         for x in 0..image.width() {
             let top = composite(image.get_pixel(x, y), background);
@@ -1640,12 +2092,16 @@ fn decode_media_edit_from_path(
 fn kitty_image_edit(
     range: Range<usize>,
     image: &RgbaImage,
+    columns: u32,
+    rows: u32,
     header: String,
     newline_after_last: bool,
 ) -> anyhow::Result<MediaEdit> {
-    let columns = image.width().min(MAX_KITTY_COLUMNS);
-    let rows = image.height().div_ceil(2).min(MAX_KITTY_ROWS);
     anyhow::ensure!(columns > 0 && rows > 0, "Kitty image has no cells");
+    anyhow::ensure!(
+        columns <= MAX_KITTY_COLUMNS && rows <= MAX_KITTY_ROWS,
+        "Kitty placement exceeds cell limits"
+    );
 
     let mut png = Vec::new();
     PngEncoder::new(&mut png).write_image(
@@ -1712,6 +2168,7 @@ fn fetch_remote_media_edit(
     mode: MediaMode,
     background: [u8; 3],
     true_color: bool,
+    show_links: bool,
 ) -> anyhow::Result<MediaEdit> {
     anyhow::ensure!(
         media.destination.starts_with("http://") || media.destination.starts_with("https://"),
@@ -1738,6 +2195,7 @@ fn fetch_remote_media_edit(
         mode,
         background,
         true_color,
+        show_links,
     )
 }
 
@@ -1771,6 +2229,43 @@ fn bounded_curl_command(url: &str, output: &Path) -> Command {
     command
 }
 
+/// Scale `(width, height)` to fit inside the bounds while preserving the
+/// aspect ratio, and never enlarge: an image smaller than the pane should stay
+/// its own size rather than being blown up to fill it.
+fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    if width == 0 || height == 0 || max_width == 0 || max_height == 0 {
+        return (0, 0);
+    }
+    let scale = (max_width as f32 / width as f32)
+        .min(max_height as f32 / height as f32)
+        .min(1.0);
+    (
+        ((width as f32 * scale).round() as u32).max(1),
+        ((height as f32 * scale).round() as u32).max(1),
+    )
+}
+
+/// Choose the cell rectangle a Kitty placement should occupy.  Kitty stretches
+/// the image to exactly fill it, so the aspect ratio has to live in the cell
+/// counts, not in the pixels.
+fn kitty_cells(width: u32, height: u32, max_columns: u32, max_rows: u32) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (0, 0);
+    }
+    let natural_columns = width.div_ceil(ASSUMED_CELL_WIDTH).max(1);
+    let mut columns = natural_columns.min(max_columns).max(1);
+    let rows_for = |columns: u32| {
+        (((columns as f32 * height as f32) / (width as f32 * CELL_ASPECT)).round() as u32).max(1)
+    };
+    let mut rows = rows_for(columns);
+    if rows > max_rows {
+        rows = max_rows;
+        columns = (((rows as f32 * CELL_ASPECT * width as f32) / height as f32).round() as u32)
+            .clamp(1, max_columns);
+    }
+    (columns, rows)
+}
+
 fn media_limits() -> Limits {
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_MEDIA_DIMENSION);
@@ -1779,14 +2274,37 @@ fn media_limits() -> Limits {
     limits
 }
 
-fn media_status_edit(media: &Media, status: &str, dimensions: Option<(u32, u32)>) -> MediaEdit {
+/// The caption above a decoded image.  Once the pixels are on screen the alt
+/// text and the URL are both noise, so unless links are explicitly requested
+/// there is no caption at all.
+fn media_header(media: &Media, width: u32, height: u32, mode: &str, show_links: bool) -> String {
+    if show_links {
+        format!(
+            "🖼 {} — {} [{}×{}; {}]\n",
+            media.alt, media.destination, width, height, mode
+        )
+    } else {
+        String::new()
+    }
+}
+
+fn media_status_edit(
+    media: &Media,
+    status: &str,
+    dimensions: Option<(u32, u32)>,
+    show_links: bool,
+) -> MediaEdit {
     let dimensions = dimensions
         .map(|(width, height)| format!("{width}×{height}; "))
         .unwrap_or_default();
-    let text = format!(
-        "🖼 {} — {} [{}{}]",
-        media.alt, media.destination, dimensions, status
-    );
+    // No pixels are shown here, so the alt text stays: it is the only
+    // description the reader gets.
+    let destination = if show_links {
+        format!(" — {}", media.destination)
+    } else {
+        String::new()
+    };
+    let text = format!("🖼 {}{} [{}{}]", media.alt, destination, dimensions, status);
     let length = text.chars().count();
     MediaEdit {
         range: media.output.clone(),
@@ -1817,6 +2335,15 @@ fn terminal_color(rgb: [u8; 3], true_color: bool) -> Color {
         let green = ((u16::from(rgb[1]) * 5 + 127) / 255) as u8;
         let blue = ((u16::from(rgb[2]) * 5 + 127) / 255) as u8;
         Color::Indexed(16 + 36 * red + 6 * green + blue)
+    }
+}
+
+/// Same resolution as `theme_background`, but an unset foreground means "the
+/// terminal's default text colour", which is light rather than black.
+fn theme_foreground(color: Option<Color>) -> [u8; 3] {
+    match color {
+        Some(Color::Reset) | None => [220, 220, 220],
+        color => theme_background(color),
     }
 }
 
@@ -2153,10 +2680,14 @@ fn markdown_render_local_media_async(
     mode: String,
     allow_remote: bool,
     raster_math: bool,
+    show_links: bool,
     callback: SteelVal,
 ) -> anyhow::Result<()> {
     let mode = MediaMode::parse(&mode)?;
     let background = theme_background(cx.editor.theme.get("ui.background").bg);
+    // Rasterized math is painted in the theme's own text colour so it stays
+    // legible on light and dark themes alike.
+    let foreground = theme_foreground(cx.editor.theme.get("ui.text").fg);
     let true_color = cx.editor.config.load().true_color || crate::true_color();
     let rooted = callback.as_rooted();
     let future = async move {
@@ -2165,9 +2696,11 @@ fn markdown_render_local_media_async(
                 render,
                 mode,
                 background,
+                foreground,
                 true_color,
                 allow_remote,
                 raster_math,
+                show_links,
             )
         })
         .await
@@ -2252,6 +2785,39 @@ fn apply_focused(cx: &mut Context, render: SteelMarkdownRender) -> bool {
     true
 }
 
+/// Character offset of the first line the focused view has scrolled to.
+/// Restoring it is what keeps a re-rendered preview visually still; the cursor
+/// alone only guarantees the cursor stays on screen, not where the page sits.
+fn view_anchor(cx: &mut Context) -> usize {
+    let view_id = cx.editor.tree.focus;
+    let doc_id = cx.editor.tree.get(view_id).doc;
+    cx.editor
+        .documents
+        .get(&doc_id)
+        .map(|doc| doc.view_offset(view_id).anchor)
+        .unwrap_or(0)
+}
+
+fn set_view_anchor(cx: &mut Context, anchor: usize) -> bool {
+    let view_id = cx.editor.tree.focus;
+    let doc_id = cx.editor.tree.get(view_id).doc;
+    let Some(doc) = cx.editor.documents.get_mut(&doc_id) else {
+        return false;
+    };
+    let anchor = anchor.min(doc.text().len_chars());
+    let mut offset = doc.view_offset(view_id);
+    offset.anchor = anchor;
+    doc.set_view_offset(view_id, offset);
+    true
+}
+
+/// Put text straight into the yank register.  The preview's code blocks are
+/// framed, so there is no buffer range that holds the code and nothing else.
+fn copy_text(cx: &mut Context, text: String) -> anyhow::Result<()> {
+    let register = cx.editor.config().default_yank_register;
+    cx.editor.registers.write(register, vec![text])
+}
+
 fn clear_focused(cx: &mut Context) -> bool {
     let view_id = cx.editor.tree.focus;
     let doc_id = cx.editor.tree.get(view_id).doc;
@@ -2325,6 +2891,9 @@ pub(super) fn register(module: &mut BuiltInModule) {
         .register_fn("markdown-render-output-for-source", output_for_source)
         .register_fn_with_ctx(CTX, "markdown-render-apply-focused!", apply_focused)
         .register_fn_with_ctx(CTX, "markdown-render-clear-focused!", clear_focused)
+        .register_fn_with_ctx(CTX, "markdown-render-view-anchor", view_anchor)
+        .register_fn_with_ctx(CTX, "markdown-render-set-view-anchor!", set_view_anchor)
+        .register_fn_with_ctx(CTX, "markdown-preview-copy-text!", copy_text)
         .register_fn_with_ctx(CTX, "markdown-preview-open-target!", open_target)
         .register_fn("markdown-render-formulas", markdown_render_formulas)
         .register_fn(
@@ -2376,6 +2945,147 @@ mod tests {
     }
 
     #[test]
+    fn separators_between_inline_runs_survive() {
+        let mut builder = Builder::new(80);
+        // `a *b* c` reaches the builder as three runs whose spaces sit at the
+        // edges that `split_whitespace` used to discard.
+        builder.emit_wrapped("a ", &[], 0..2, "text:0", "");
+        builder.emit_wrapped("b", &[], 2..3, "text:1", "");
+        builder.emit_wrapped(" c", &[], 3..5, "text:2", "");
+        assert_eq!(builder.text, "a b c");
+
+        // Runs that abut in the source must not gain one.
+        let mut builder = Builder::new(80);
+        builder.emit_wrapped("a", &[], 0..1, "text:0", "");
+        builder.emit_wrapped("b", &[], 1..2, "text:1", "");
+        assert_eq!(builder.text, "ab");
+    }
+
+    #[test]
+    fn a_pending_space_never_starts_a_line() {
+        let mut builder = Builder::new(80);
+        builder.emit_wrapped("a ", &[], 0..2, "text:0", "");
+        builder.newline();
+        builder.emit_wrapped("b", &[], 2..3, "text:1", "");
+        assert_eq!(builder.text, "a\nb");
+    }
+
+    #[test]
+    fn html_comments_are_removed_across_events() {
+        let mut open = false;
+        assert_eq!(strip_html("<!-- hidden -->", &mut open).0, "");
+        assert!(!open);
+
+        // A block comment is reported one line per event.
+        assert_eq!(strip_html("<!-- start", &mut open).0, "");
+        assert!(open);
+        assert_eq!(strip_html("still hidden", &mut open).0, "");
+        assert_eq!(strip_html("end --> after", &mut open).0, " after");
+        assert!(!open);
+    }
+
+    #[test]
+    fn html_tags_are_stripped_rather_than_escaped() {
+        let mut open = false;
+        assert_eq!(strip_html("<b>bold</b>", &mut open).0, "bold");
+        assert_eq!(strip_html("a<br/>b", &mut open), ("ab".to_string(), 1));
+        // A stray `<` is text, not the start of a tag.
+        assert_eq!(strip_html("2 < 3", &mut open).0, "2 < 3");
+    }
+
+    #[test]
+    fn header_cells_survive_a_headless_table_row_event() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let mut options = Options::ENABLE_GFM;
+        options.insert(Options::ENABLE_TABLES);
+        let mut table: Option<TableState> = None;
+        for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+            match (&event, table.is_some()) {
+                (Event::Start(Tag::Table(alignments)), _) => {
+                    table = Some(TableState {
+                        alignments: alignments.clone(),
+                        rows: Vec::new(),
+                        row: Vec::new(),
+                        cell: None,
+                        header_rows: 0,
+                        in_head: false,
+                        source: range,
+                    })
+                }
+                (Event::End(TagEnd::Table), _) => break,
+                (_, true) => capture_table_event(table.as_mut().unwrap(), &event, range),
+                _ => {}
+            }
+        }
+        let table = table.expect("table was parsed");
+        assert_eq!(table.header_rows, 1);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0][0].text, "a");
+        assert_eq!(table.rows[1][0].text, "1");
+    }
+
+    #[test]
+    fn fitting_preserves_aspect_and_never_enlarges() {
+        // A wide image constrained by width keeps its proportions.
+        assert_eq!(fit_dimensions(400, 100, 80, 120), (80, 20));
+        // Constrained by height instead.
+        assert_eq!(fit_dimensions(100, 400, 80, 40), (10, 40));
+        // Smaller than the bounds: left alone rather than blown up.
+        assert_eq!(fit_dimensions(30, 20, 80, 120), (30, 20));
+    }
+
+    #[test]
+    fn kitty_cells_account_for_the_cell_aspect() {
+        // A square image needs half as many rows as columns on a 1:2 cell.
+        let (columns, rows) = kitty_cells(256, 256, 64, 64);
+        assert_eq!(columns, 32);
+        assert_eq!(rows, 16);
+        // Row-limited images shed columns instead of stretching.
+        let (columns, rows) = kitty_cells(100, 4000, 64, 10);
+        assert_eq!(rows, 10);
+        assert!(
+            columns < 13,
+            "columns {columns} should shrink with the rows"
+        );
+        assert!(columns >= 1);
+    }
+
+    #[test]
+    fn code_blocks_are_framed_and_padded_evenly() {
+        let mut builder = Builder::new(40);
+        let node = builder.node("code");
+        // Exercise the framing without a Context by driving the same helpers.
+        let code = expand_tabs("fn a() {\n\tb();\n}\n");
+        assert!(!code.contains('\t'));
+        let chunks = wrap_code_line("aaaaaa", 4);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].text, "aaaa");
+        assert_eq!(chunks[0].range, 0..4);
+        assert_eq!(chunks[1].range, 4..6);
+        // `node` is consumed only to keep the builder's counter honest.
+        assert!(node.starts_with("code:"));
+    }
+
+    #[test]
+    fn a_hidden_destination_leaves_only_the_caption() {
+        let media = Media {
+            alt: "diagram".into(),
+            destination: "/tmp/a.png".into(),
+            resolved: true,
+            remote: false,
+            output: 0..4,
+            source: 0..4,
+        };
+        // Decoded pixels need no caption at all.
+        assert_eq!(media_header(&media, 10, 10, "unicode", false), "");
+        assert!(media_header(&media, 10, 10, "unicode", true).contains("/tmp/a.png"));
+        // A placeholder keeps the alt text, since nothing else describes it.
+        let status = media_status_edit(&media, "external", None, false);
+        assert!(status.text.contains("diagram"));
+        assert!(!status.text.contains("/tmp/a.png"));
+    }
+
+    #[test]
     fn explicit_anchors_precede_heading_fallbacks() {
         let mut builder = Builder::new(80);
         builder.anchors.insert("fn-one".into(), 12);
@@ -2417,8 +3127,16 @@ mod tests {
             source: 0..4,
         });
         let render = SteelMarkdownRender(Arc::new(builder.finish("![x](sample.png)".into())));
-        let rendered =
-            render_local_media(render, MediaMode::Unicode, [0, 0, 0], true, false, false);
+        let rendered = render_local_media(
+            render,
+            MediaMode::Unicode,
+            [0, 0, 0],
+            [255, 255, 255],
+            true,
+            false,
+            false,
+            false,
+        );
 
         assert!(rendered.0.text.contains('▀'));
         assert!(rendered.0.styles.iter().any(|style| matches!(
@@ -2501,21 +3219,45 @@ mod tests {
         }
         let formula = Formula {
             tex: r"\alpha + x_2".into(),
-            display: false,
+            // Only display math rasterizes outside Kitty: an inline half-block
+            // run has a single cell of vertical room.
+            display: true,
             output: 0..6,
             source: 0..12,
         };
-        let edit = raster_math_edit(&formula, 80, MediaMode::Unicode, [0, 0, 0], true).unwrap();
+        let edit = raster_math_edit(
+            &formula,
+            80,
+            MediaMode::Unicode,
+            [0, 0, 0],
+            [255, 255, 255],
+            true,
+        )
+        .unwrap();
         assert!(edit.text.contains('▀'));
         assert!(edit
             .styles
             .iter()
             .any(|style| matches!(style.style, RenderStyle::Concrete(_))));
 
+        let inline = Formula {
+            display: false,
+            ..formula.clone()
+        };
+        assert!(raster_math_edit(
+            &inline,
+            80,
+            MediaMode::Unicode,
+            [0, 0, 0],
+            [255, 255, 255],
+            true
+        )
+        .is_err());
+
         let invalid = Formula {
             tex: r"\definitelyMissingCommand".into(),
             ..formula
         };
-        assert!(generate_math_png(&invalid).is_err());
+        assert!(generate_math_png(&invalid, [255, 255, 255]).is_err());
     }
 }
