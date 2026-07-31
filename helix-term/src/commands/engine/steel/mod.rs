@@ -5467,7 +5467,7 @@ fn lsp_reply_ok(
 
 type LocalJobCallback = dyn FnOnce(&mut Editor, &mut Compositor, &mut job::Jobs);
 
-fn create_callback<T: TryInto<SteelVal, Error = SteelErr> + 'static>(
+pub(super) fn create_callback<T: TryInto<SteelVal, Error = SteelErr> + 'static>(
     cx: &mut Context,
     future: impl std::future::Future<Output = Result<T, helix_lsp::Error>> + 'static,
     rooted: steel::RootedSteelVal,
