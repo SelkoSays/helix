@@ -88,6 +88,7 @@ struct MarkdownRender {
     width: usize,
     styles: Vec<StyledRange>,
     mappings: Vec<SourceMap>,
+    anchors: HashMap<String, usize>,
     headings: Vec<Heading>,
     links: Vec<Link>,
     code_blocks: Vec<CodeBlock>,
@@ -150,6 +151,7 @@ struct Builder {
     column: usize,
     styles: Vec<StyledRange>,
     mappings: Vec<SourceMap>,
+    anchors: HashMap<String, usize>,
     headings: Vec<Heading>,
     links: Vec<Link>,
     code_blocks: Vec<CodeBlock>,
@@ -166,6 +168,7 @@ impl Builder {
             column: 0,
             styles: Vec::new(),
             mappings: Vec::new(),
+            anchors: HashMap::new(),
             headings: Vec::new(),
             links: Vec::new(),
             code_blocks: Vec::new(),
@@ -294,6 +297,7 @@ impl Builder {
             width: self.width,
             styles: self.styles,
             mappings: self.mappings,
+            anchors: self.anchors,
             headings: self.headings,
             links: self.links,
             code_blocks: self.code_blocks,
@@ -324,6 +328,8 @@ fn render(
     let mut code: Option<NativeCodeState> = None;
     let mut table: Option<TableState> = None;
     let mut quote_depth = 0usize;
+    let mut footnote_definitions = Vec::new();
+    let mut footnote_references: HashMap<String, usize> = HashMap::new();
 
     for (event, byte_range) in Parser::new_ext(&source, options).into_offset_iter() {
         let source_range = byte_range_to_chars(&source, byte_range);
@@ -431,6 +437,10 @@ fn render(
                     Tag::FootnoteDefinition(label) => {
                         builder.blank_line();
                         let node = builder.node("footnote");
+                        builder
+                            .anchors
+                            .insert(format!("fn-{label}"), builder.char_len());
+                        footnote_definitions.push(label.to_string());
                         builder.emit_raw(
                             &format!("[^{label}] "),
                             &["markup.link.label"],
@@ -512,8 +522,24 @@ fn render(
                     }
                     TagEnd::Item => builder.newline(),
                     TagEnd::FootnoteDefinition => {
+                        let label = footnote_definitions.pop();
+                        let start = builder.char_len();
                         let node = builder.node("footnote-backlink");
-                        builder.emit_raw(" ↩", &["markup.link.url"], source_range.clone(), &node);
+                        let output = builder.emit_raw(
+                            " ↩",
+                            &["markup.link.url"],
+                            source_range.clone(),
+                            &node,
+                        );
+                        if let Some(label) = label {
+                            builder.links.push(Link {
+                                label: "back to reference".to_string(),
+                                destination: format!("#fnref-{label}"),
+                                resolved: true,
+                                output: start..output.end,
+                                source: source_range.clone(),
+                            });
+                        }
                         builder.blank_line();
                     }
                     TagEnd::Table => {
@@ -658,6 +684,14 @@ fn render(
             }
             Event::FootnoteReference(label) => {
                 let node = builder.node("footnote-reference");
+                let count = footnote_references.entry(label.to_string()).or_default();
+                let anchor = if *count == 0 {
+                    format!("fnref-{label}")
+                } else {
+                    format!("fnref-{label}-{}", *count + 1)
+                };
+                *count += 1;
+                builder.anchors.insert(anchor, builder.char_len());
                 let output = builder.emit_raw(
                     &format!("[^{label}]"),
                     &["markup.link.label"],
@@ -1206,6 +1240,17 @@ fn markdown_render_mappings(render: &SteelMarkdownRender) -> SteelVal {
     }))
 }
 
+fn markdown_render_anchor_output(render: &SteelMarkdownRender, anchor: String) -> Option<usize> {
+    render.0.anchors.get(&anchor).copied().or_else(|| {
+        render
+            .0
+            .headings
+            .iter()
+            .find(|heading| heading.anchor == anchor)
+            .map(|heading| heading.output)
+    })
+}
+
 fn source_for_output(render: &SteelMarkdownRender, output: usize) -> Option<usize> {
     nearest_mapping(&render.0.mappings, output, true)
 }
@@ -1341,6 +1386,10 @@ pub(super) fn register(module: &mut BuiltInModule) {
         .register_fn("markdown-render-code-blocks", markdown_render_code_blocks)
         .register_fn("markdown-render-media", markdown_render_media)
         .register_fn("markdown-render-mappings", markdown_render_mappings)
+        .register_fn(
+            "markdown-render-anchor-output",
+            markdown_render_anchor_output,
+        )
         .register_fn("markdown-render-source-for-output", source_for_output)
         .register_fn("markdown-render-output-for-source", output_for_source)
         .register_fn_with_ctx(CTX, "markdown-render-apply-focused!", apply_focused)
@@ -1387,5 +1436,20 @@ mod tests {
     #[test]
     fn table_cells_wrap_at_terminal_width() {
         assert_eq!(wrap_cell("one two three", 7), vec!["one two", "three"]);
+    }
+
+    #[test]
+    fn explicit_anchors_precede_heading_fallbacks() {
+        let mut builder = Builder::new(80);
+        builder.anchors.insert("fn-one".into(), 12);
+        let render = SteelMarkdownRender(Arc::new(builder.finish(String::new())));
+        assert_eq!(
+            markdown_render_anchor_output(&render, "fn-one".into()),
+            Some(12)
+        );
+        assert_eq!(
+            markdown_render_anchor_output(&render, "missing".into()),
+            None
+        );
     }
 }
