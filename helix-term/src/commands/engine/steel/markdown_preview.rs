@@ -3,21 +3,30 @@
 //! Parsing, layout, source mapping and concrete syntax styles stay native.
 //! Steel owns the scratch-buffer lifecycle and interaction policy.
 
-use std::{collections::HashMap, ops::Range, path::Path, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    ops::Range,
+    path::{Path, PathBuf},
+    process::Command,
+    str::FromStr,
+    sync::Arc,
+};
 
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::{
     annotations::custom_text::{CustomHighlight, CustomHighlightStyle, CustomTextAnnotations},
     editor::Action,
-    graphics::Style,
+    graphics::{Color, Style},
 };
+use image::{imageops, ImageReader, Limits, Rgba};
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
 use steel::{
     rvals::{AsRefSteelVal, Custom, IntoSteelVal},
     steel_vm::{builtin::BuiltInModule, register_fn::RegisterFn},
-    SteelVal,
+    SteelErr, SteelVal,
 };
 
 use super::{syntax_highlight, Context, CTX};
@@ -25,6 +34,12 @@ use super::{syntax_highlight, Context, CTX};
 const MIN_WIDTH: usize = 20;
 const MAX_WIDTH: usize = 500;
 const DECORATION_NAMESPACE: &str = "markdown-preview";
+const MAX_MEDIA_BYTES: u64 = 12 * 1024 * 1024;
+const MAX_MEDIA_DIMENSION: u32 = 8192;
+const MAX_MEDIA_PIXELS: u64 = 24_000_000;
+const MAX_MEDIA_CELLS: usize = 200_000;
+const MAX_MEDIA_HEIGHT_CELLS: usize = 60;
+const MAX_REMOTE_MEDIA: usize = 8;
 
 #[derive(Clone, Debug)]
 enum RenderStyle {
@@ -95,10 +110,43 @@ struct MarkdownRender {
     media: Vec<Media>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaMode {
+    External,
+    Unicode,
+}
+
+impl MediaMode {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "external" => Ok(Self::External),
+            "unicode" => Ok(Self::Unicode),
+            _ => anyhow::bail!("local media mode must be external or unicode"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MediaEdit {
+    range: Range<usize>,
+    text: String,
+    styles: Vec<StyledRange>,
+}
+
 #[derive(Clone)]
 struct SteelMarkdownRender(Arc<MarkdownRender>);
 
 impl Custom for SteelMarkdownRender {}
+
+struct MarkdownCallbackValue(SteelMarkdownRender);
+
+impl TryInto<SteelVal> for MarkdownCallbackValue {
+    type Error = SteelErr;
+
+    fn try_into(self) -> Result<SteelVal, Self::Error> {
+        self.0.into_steelval()
+    }
+}
 
 #[derive(Default)]
 struct HeadingState {
@@ -599,7 +647,13 @@ fn render(
                                 "  ",
                             );
                             builder.emit_raw(
-                                " [external]",
+                                if state.remote {
+                                    " [remote blocked]"
+                                } else if state.resolved {
+                                    " [external; inspecting]"
+                                } else {
+                                    " [unresolved]"
+                                },
                                 &["ui.text.inactive"],
                                 state.source.clone(),
                                 &node,
@@ -1140,6 +1194,430 @@ fn has_scheme(value: &str) -> bool {
     })
 }
 
+fn render_local_media(
+    render: SteelMarkdownRender,
+    mode: MediaMode,
+    background: [u8; 3],
+    true_color: bool,
+    allow_remote: bool,
+) -> SteelMarkdownRender {
+    let mut edits = Vec::new();
+    let mut remote_count = 0;
+    for media in &render.0.media {
+        if !media.resolved {
+            continue;
+        }
+        let result = if media.remote {
+            if !allow_remote {
+                continue;
+            }
+            if remote_count >= MAX_REMOTE_MEDIA {
+                Ok(media_status_edit(media, "remote item limit exceeded", None))
+            } else {
+                remote_count += 1;
+                fetch_remote_media_edit(media, render.0.width, mode, background, true_color)
+            }
+        } else if !has_scheme(&media.destination) {
+            decode_media_edit(media, render.0.width, mode, background, true_color)
+        } else {
+            continue;
+        };
+        edits.push(result.unwrap_or_else(|error| {
+            media_status_edit(media, &format!("media failed: {error}"), None)
+        }));
+    }
+    SteelMarkdownRender(Arc::new(apply_media_edits(render.0.as_ref(), edits)))
+}
+
+fn decode_media_edit(
+    media: &Media,
+    render_width: usize,
+    mode: MediaMode,
+    background: [u8; 3],
+    true_color: bool,
+) -> anyhow::Result<MediaEdit> {
+    let path = PathBuf::from(
+        media
+            .destination
+            .split_once('#')
+            .map(|(path, _)| path)
+            .unwrap_or(&media.destination),
+    );
+    decode_media_edit_from_path(media, &path, render_width, mode, background, true_color)
+}
+
+fn decode_media_edit_from_path(
+    media: &Media,
+    path: &Path,
+    render_width: usize,
+    mode: MediaMode,
+    background: [u8; 3],
+    true_color: bool,
+) -> anyhow::Result<MediaEdit> {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+    {
+        return Ok(media_status_edit(media, "SVG; external", None));
+    }
+    let size = fs::metadata(&path)?.len();
+    anyhow::ensure!(size <= MAX_MEDIA_BYTES, "compressed file exceeds 12 MiB");
+
+    let mut dimensions_reader = ImageReader::open(&path)?.with_guessed_format()?;
+    dimensions_reader.limits(media_limits());
+    let (width, height) = dimensions_reader.into_dimensions()?;
+    anyhow::ensure!(
+        u64::from(width) * u64::from(height) <= MAX_MEDIA_PIXELS,
+        "decoded image exceeds pixel limit"
+    );
+    if mode == MediaMode::External {
+        return Ok(media_status_edit(media, "external", Some((width, height))));
+    }
+
+    let mut reader = ImageReader::open(&path)?.with_guessed_format()?;
+    reader.limits(media_limits());
+    let image = reader.decode()?.to_rgba8();
+    let max_width = render_width.clamp(MIN_WIDTH, MAX_WIDTH) as u32;
+    let max_pixel_height = (MAX_MEDIA_HEIGHT_CELLS * 2) as u32;
+    let image = imageops::thumbnail(&image, max_width, max_pixel_height);
+    let cells = image.width() as usize * image.height().div_ceil(2) as usize;
+    anyhow::ensure!(
+        cells <= MAX_MEDIA_CELLS,
+        "rendered image exceeds cell limit"
+    );
+
+    let mut text = format!(
+        "🖼 {} — {} [{}×{}; unicode]\n",
+        media.alt, media.destination, width, height
+    );
+    let mut styles = Vec::with_capacity(cells + 1);
+    styles.push(StyledRange {
+        range: 0..text.chars().count(),
+        style: RenderStyle::Scope("ui.text.inactive".to_string()),
+    });
+    for y in (0..image.height()).step_by(2) {
+        for x in 0..image.width() {
+            let top = composite(image.get_pixel(x, y), background);
+            let bottom = if y + 1 < image.height() {
+                composite(image.get_pixel(x, y + 1), background)
+            } else {
+                background
+            };
+            let start = text.chars().count();
+            text.push('▀');
+            styles.push(StyledRange {
+                range: start..start + 1,
+                style: RenderStyle::Concrete(
+                    Style::default()
+                        .fg(terminal_color(top, true_color))
+                        .bg(terminal_color(bottom, true_color)),
+                ),
+            });
+        }
+        text.push('\n');
+    }
+    Ok(MediaEdit {
+        range: media.output.clone(),
+        text,
+        styles,
+    })
+}
+
+fn fetch_remote_media_edit(
+    media: &Media,
+    render_width: usize,
+    mode: MediaMode,
+    background: [u8; 3],
+    true_color: bool,
+) -> anyhow::Result<MediaEdit> {
+    anyhow::ensure!(
+        media.destination.starts_with("http://") || media.destination.starts_with("https://"),
+        "remote media scheme is not permitted"
+    );
+    let temporary = tempfile::Builder::new()
+        .prefix("helix-markdown-preview-")
+        .tempfile()?;
+    let output = bounded_curl_command(&media.destination, temporary.path()).output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "curl exited with {}: {}",
+        output.status,
+        sanitize_controls(String::from_utf8_lossy(&output.stderr).trim())
+    );
+    anyhow::ensure!(
+        fs::metadata(temporary.path())?.len() <= MAX_MEDIA_BYTES,
+        "download exceeds byte limit"
+    );
+    decode_media_edit_from_path(
+        media,
+        temporary.path(),
+        render_width,
+        mode,
+        background,
+        true_color,
+    )
+}
+
+fn bounded_curl_command(url: &str, output: &Path) -> Command {
+    let mut command = Command::new("curl");
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--disable")
+        .arg("--fail")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--location")
+        .arg("--max-redirs")
+        .arg("3")
+        .arg("--connect-timeout")
+        .arg("3")
+        .arg("--max-time")
+        .arg("8")
+        .arg("--proto")
+        .arg("=http,https")
+        .arg("--proto-redir")
+        .arg("=http,https")
+        .arg("--max-filesize")
+        .arg(MAX_MEDIA_BYTES.to_string())
+        .arg("--user-agent")
+        .arg("helix-markdown-preview/1")
+        .arg("--output")
+        .arg(output)
+        .arg(url);
+    command
+}
+
+fn media_limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_MEDIA_DIMENSION);
+    limits.max_image_height = Some(MAX_MEDIA_DIMENSION);
+    limits.max_alloc = Some(MAX_MEDIA_PIXELS.saturating_mul(4));
+    limits
+}
+
+fn media_status_edit(media: &Media, status: &str, dimensions: Option<(u32, u32)>) -> MediaEdit {
+    let dimensions = dimensions
+        .map(|(width, height)| format!("{width}×{height}; "))
+        .unwrap_or_default();
+    let text = format!(
+        "🖼 {} — {} [{}{}]",
+        media.alt, media.destination, dimensions, status
+    );
+    let length = text.chars().count();
+    MediaEdit {
+        range: media.output.clone(),
+        text,
+        styles: vec![StyledRange {
+            range: 0..length,
+            style: RenderStyle::Scope("ui.text.inactive".to_string()),
+        }],
+    }
+}
+
+fn composite(pixel: &Rgba<u8>, background: [u8; 3]) -> [u8; 3] {
+    let alpha = u16::from(pixel[3]);
+    let inverse = 255 - alpha;
+    [
+        ((u16::from(pixel[0]) * alpha + u16::from(background[0]) * inverse) / 255) as u8,
+        ((u16::from(pixel[1]) * alpha + u16::from(background[1]) * inverse) / 255) as u8,
+        ((u16::from(pixel[2]) * alpha + u16::from(background[2]) * inverse) / 255) as u8,
+    ]
+}
+
+fn terminal_color(rgb: [u8; 3], true_color: bool) -> Color {
+    if true_color {
+        Color::Rgb(rgb[0], rgb[1], rgb[2])
+    } else {
+        let red = ((u16::from(rgb[0]) * 5 + 127) / 255) as u8;
+        let green = ((u16::from(rgb[1]) * 5 + 127) / 255) as u8;
+        let blue = ((u16::from(rgb[2]) * 5 + 127) / 255) as u8;
+        Color::Indexed(16 + 36 * red + 6 * green + blue)
+    }
+}
+
+fn theme_background(color: Option<Color>) -> [u8; 3] {
+    match color {
+        Some(Color::Rgb(red, green, blue)) => [red, green, blue],
+        Some(Color::Black | Color::Reset) | None => [0, 0, 0],
+        Some(Color::White | Color::LightGray) => [220, 220, 220],
+        Some(Color::Gray) => [128, 128, 128],
+        Some(Color::Red | Color::LightRed) => [205, 49, 49],
+        Some(Color::Green | Color::LightGreen) => [13, 188, 121],
+        Some(Color::Yellow | Color::LightYellow) => [229, 229, 16],
+        Some(Color::Blue | Color::LightBlue) => [36, 114, 200],
+        Some(Color::Magenta | Color::LightMagenta) => [188, 63, 188],
+        Some(Color::Cyan | Color::LightCyan) => [17, 168, 205],
+        Some(Color::Indexed(index)) => ansi256_rgb(index),
+    }
+}
+
+fn ansi256_rgb(index: u8) -> [u8; 3] {
+    if index < 16 {
+        return match index {
+            0 => [0, 0, 0],
+            1 => [128, 0, 0],
+            2 => [0, 128, 0],
+            3 => [128, 128, 0],
+            4 => [0, 0, 128],
+            5 => [128, 0, 128],
+            6 => [0, 128, 128],
+            7 => [192, 192, 192],
+            8 => [128, 128, 128],
+            9 => [255, 0, 0],
+            10 => [0, 255, 0],
+            11 => [255, 255, 0],
+            12 => [0, 0, 255],
+            13 => [255, 0, 255],
+            14 => [0, 255, 255],
+            _ => [255, 255, 255],
+        };
+    }
+    if index >= 232 {
+        let level = 8 + (index - 232) * 10;
+        return [level, level, level];
+    }
+    let index = index - 16;
+    let level = |value: u8| if value == 0 { 0 } else { 55 + value * 40 };
+    [level(index / 36), level((index % 36) / 6), level(index % 6)]
+}
+
+fn apply_media_edits(render: &MarkdownRender, mut edits: Vec<MediaEdit>) -> MarkdownRender {
+    edits.sort_by_key(|edit| edit.range.start);
+    edits.retain(|edit| {
+        edit.range.start <= edit.range.end && edit.range.end <= render.text.chars().count()
+    });
+    let mut text = String::new();
+    let mut cursor = 0;
+    let mut inserted_styles = Vec::new();
+    for edit in &edits {
+        if edit.range.start < cursor {
+            continue;
+        }
+        text.push_str(char_slice(&render.text, cursor..edit.range.start));
+        let offset = text.chars().count();
+        text.push_str(&edit.text);
+        inserted_styles.extend(edit.styles.iter().cloned().map(|mut style| {
+            style.range = offset + style.range.start..offset + style.range.end;
+            style
+        }));
+        cursor = edit.range.end;
+    }
+    text.push_str(char_slice(
+        &render.text,
+        cursor..render.text.chars().count(),
+    ));
+
+    let map_range = |range: &Range<usize>| {
+        map_position(range.start, &edits, false)..map_position(range.end, &edits, true)
+    };
+    let mut styles = render
+        .styles
+        .iter()
+        .filter(|style| {
+            !edits
+                .iter()
+                .any(|edit| intersects(&style.range, &edit.range))
+        })
+        .cloned()
+        .map(|mut style| {
+            style.range = map_range(&style.range);
+            style
+        })
+        .collect::<Vec<_>>();
+    styles.extend(inserted_styles);
+
+    let mut updated = render.clone();
+    updated.text = text;
+    updated.styles = styles;
+    updated.mappings = render
+        .mappings
+        .iter()
+        .cloned()
+        .map(|mut mapping| {
+            mapping.output = map_range(&mapping.output);
+            mapping
+        })
+        .collect();
+    updated.anchors = render
+        .anchors
+        .iter()
+        .map(|(anchor, position)| (anchor.clone(), map_position(*position, &edits, false)))
+        .collect();
+    updated.headings = render
+        .headings
+        .iter()
+        .cloned()
+        .map(|mut heading| {
+            heading.output = map_position(heading.output, &edits, false);
+            heading
+        })
+        .collect();
+    updated.links = render
+        .links
+        .iter()
+        .cloned()
+        .map(|mut link| {
+            link.output = map_range(&link.output);
+            link
+        })
+        .collect();
+    updated.code_blocks = render
+        .code_blocks
+        .iter()
+        .cloned()
+        .map(|mut block| {
+            block.output = map_range(&block.output);
+            block
+        })
+        .collect();
+    updated.media = render
+        .media
+        .iter()
+        .cloned()
+        .map(|mut media| {
+            media.output = map_range(&media.output);
+            media
+        })
+        .collect();
+    updated
+}
+
+fn char_slice(value: &str, range: Range<usize>) -> &str {
+    let start = value
+        .char_indices()
+        .nth(range.start)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len());
+    let end = value
+        .char_indices()
+        .nth(range.end)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len());
+    &value[start..end]
+}
+
+fn intersects(first: &Range<usize>, second: &Range<usize>) -> bool {
+    first.start < second.end && second.start < first.end
+}
+
+fn map_position(position: usize, edits: &[MediaEdit], _end: bool) -> usize {
+    let mut delta = 0isize;
+    for edit in edits {
+        let replacement = edit.text.chars().count();
+        if position < edit.range.start {
+            break;
+        }
+        if position >= edit.range.end {
+            delta += replacement as isize - edit.range.len() as isize;
+            continue;
+        }
+        let offset = position.saturating_sub(edit.range.start).min(replacement);
+        return (edit.range.start as isize + delta) as usize + offset;
+    }
+    (position as isize + delta) as usize
+}
+
 fn steel_integer(value: Option<&SteelVal>) -> Option<usize> {
     match value? {
         SteelVal::IntV(value) if *value >= 0 => Some(*value as usize),
@@ -1249,6 +1727,28 @@ fn markdown_render_anchor_output(render: &SteelMarkdownRender, anchor: String) -
             .find(|heading| heading.anchor == anchor)
             .map(|heading| heading.output)
     })
+}
+
+fn markdown_render_local_media_async(
+    cx: &mut Context,
+    render: SteelMarkdownRender,
+    mode: String,
+    allow_remote: bool,
+    callback: SteelVal,
+) -> anyhow::Result<()> {
+    let mode = MediaMode::parse(&mode)?;
+    let background = theme_background(cx.editor.theme.get("ui.background").bg);
+    let true_color = cx.editor.config.load().true_color || crate::true_color();
+    let rooted = callback.as_rooted();
+    let future = async move {
+        let render = tokio::task::spawn_blocking(move || {
+            render_local_media(render, mode, background, true_color, allow_remote)
+        })
+        .await
+        .map_err(|error| helix_lsp::Error::Other(anyhow::Error::from(error)))?;
+        Ok::<_, helix_lsp::Error>(MarkdownCallbackValue(render))
+    };
+    super::super::create_callback(cx, future, rooted)
 }
 
 fn source_for_output(render: &SteelMarkdownRender, output: usize) -> Option<usize> {
@@ -1390,6 +1890,11 @@ pub(super) fn register(module: &mut BuiltInModule) {
             "markdown-render-anchor-output",
             markdown_render_anchor_output,
         )
+        .register_fn_with_ctx(
+            CTX,
+            "markdown-render-local-media!",
+            markdown_render_local_media_async,
+        )
         .register_fn("markdown-render-source-for-output", source_for_output)
         .register_fn("markdown-render-output-for-source", output_for_source)
         .register_fn_with_ctx(CTX, "markdown-render-apply-focused!", apply_focused)
@@ -1400,6 +1905,8 @@ pub(super) fn register(module: &mut BuiltInModule) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
+    use std::fs::File;
 
     #[test]
     fn heading_slugs_are_deduplicated() {
@@ -1451,5 +1958,90 @@ mod tests {
             markdown_render_anchor_output(&render, "missing".into()),
             None
         );
+    }
+
+    #[test]
+    fn unicode_media_is_bounded_colored_and_remapped() {
+        let temporary = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        let pixels = [255, 0, 0, 255, 0, 0, 255, 128];
+        PngEncoder::new(File::create(temporary.path()).unwrap())
+            .write_image(&pixels, 1, 2, ExtendedColorType::Rgba8)
+            .unwrap();
+
+        let placeholder = "image placeholder";
+        let mut builder = Builder::new(40);
+        let output = builder.emit_raw(placeholder, &["markup.link.url"], 0..4, "image:0");
+        builder.media.push(Media {
+            alt: "sample".into(),
+            destination: temporary.path().to_string_lossy().into_owned(),
+            resolved: true,
+            remote: false,
+            output: output.clone(),
+            source: 0..4,
+        });
+        builder.links.push(Link {
+            label: "sample".into(),
+            destination: temporary.path().to_string_lossy().into_owned(),
+            resolved: true,
+            output,
+            source: 0..4,
+        });
+        let render = SteelMarkdownRender(Arc::new(builder.finish("![x](sample.png)".into())));
+        let rendered = render_local_media(render, MediaMode::Unicode, [0, 0, 0], true, false);
+
+        assert!(rendered.0.text.contains('▀'));
+        assert!(rendered.0.styles.iter().any(|style| matches!(
+            style.style,
+            RenderStyle::Concrete(Style {
+                fg: Some(Color::Rgb(255, 0, 0)),
+                ..
+            })
+        )));
+        let text_length = rendered.0.text.chars().count();
+        assert!(rendered
+            .0
+            .mappings
+            .windows(2)
+            .all(|pair| pair[0].output.start <= pair[1].output.start));
+        assert!(rendered
+            .0
+            .links
+            .iter()
+            .all(|link| link.output.end <= text_length));
+    }
+
+    #[test]
+    fn indexed_color_quantization_is_used_without_truecolor() {
+        assert!(matches!(
+            terminal_color([255, 0, 0], false),
+            Color::Indexed(_)
+        ));
+        assert_eq!(composite(&Rgba([255, 255, 255, 0]), [3, 4, 5]), [3, 4, 5]);
+    }
+
+    #[test]
+    fn remote_fetch_command_is_bounded_and_credential_free() {
+        let command = bounded_curl_command("https://example.test/image.png", Path::new("/tmp/out"));
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for required in [
+            "--disable",
+            "--max-redirs",
+            "--connect-timeout",
+            "--max-time",
+            "--proto",
+            "--proto-redir",
+            "--max-filesize",
+        ] {
+            assert!(arguments.iter().any(|argument| argument == required));
+        }
+        assert!(!arguments
+            .iter()
+            .any(|argument| { matches!(argument.as_str(), "--cookie" | "--user" | "--netrc") }));
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "PATH" && value.is_some()));
     }
 }

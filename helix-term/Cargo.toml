@@ -75,6 +75,8 @@ grep-searcher = "0.1"
 grep-matcher = "0.1"
 # markdown doc rendering
 pulldown-cmark = { version = "0.13", default-features = false }
+image = { version = "=0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+tempfile.workspace = true
 thiserror.workspace = true
 
 # opening URLs
