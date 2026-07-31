@@ -12,6 +12,7 @@
          markdown-render-mappings
          markdown-render-anchor-output
          markdown-render-local-media!
+         markdown-render-formulas
          markdown-render-source-for-output
          markdown-render-output-for-source
          markdown-render-apply-focused!
@@ -57,6 +58,9 @@
 ;; identity-bearing render. Remote media requires the explicit boolean grant;
 ;; SVG and failures stay placeholders.
 (define markdown-render-local-media! helix.markdown-render-local-media!)
+
+;; Formula rows are `(tex display? output-start output-end source-start source-end)`.
+(define markdown-render-formulas helix.markdown-render-formulas)
 (define markdown-render-source-for-output helix.markdown-render-source-for-output)
 (define markdown-render-output-for-source helix.markdown-render-output-for-source)
 

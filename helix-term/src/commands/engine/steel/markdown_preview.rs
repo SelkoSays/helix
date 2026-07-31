@@ -8,9 +8,9 @@ use std::{
     fs,
     ops::Range,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use helix_core::unicode::width::UnicodeWidthStr;
@@ -40,6 +40,9 @@ const MAX_MEDIA_PIXELS: u64 = 24_000_000;
 const MAX_MEDIA_CELLS: usize = 200_000;
 const MAX_MEDIA_HEIGHT_CELLS: usize = 60;
 const MAX_REMOTE_MEDIA: usize = 8;
+const MAX_TEX_BYTES: usize = 16 * 1024;
+const MAX_TEX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_MATH_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 enum RenderStyle {
@@ -97,6 +100,14 @@ struct Media {
 }
 
 #[derive(Clone, Debug)]
+struct Formula {
+    tex: String,
+    display: bool,
+    output: Range<usize>,
+    source: Range<usize>,
+}
+
+#[derive(Clone, Debug)]
 struct MarkdownRender {
     text: String,
     source_text: String,
@@ -108,6 +119,7 @@ struct MarkdownRender {
     links: Vec<Link>,
     code_blocks: Vec<CodeBlock>,
     media: Vec<Media>,
+    formulas: Vec<Formula>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +144,14 @@ struct MediaEdit {
     text: String,
     styles: Vec<StyledRange>,
 }
+
+#[derive(Default)]
+struct MathCache {
+    entries: HashMap<String, Arc<Vec<u8>>>,
+    bytes: usize,
+}
+
+static MATH_CACHE: OnceLock<Mutex<MathCache>> = OnceLock::new();
 
 #[derive(Clone)]
 struct SteelMarkdownRender(Arc<MarkdownRender>);
@@ -204,6 +224,7 @@ struct Builder {
     links: Vec<Link>,
     code_blocks: Vec<CodeBlock>,
     media: Vec<Media>,
+    formulas: Vec<Formula>,
     node_index: usize,
     heading_ids: HashMap<String, usize>,
 }
@@ -221,6 +242,7 @@ impl Builder {
             links: Vec::new(),
             code_blocks: Vec::new(),
             media: Vec::new(),
+            formulas: Vec::new(),
             node_index: 0,
             heading_ids: HashMap::new(),
         }
@@ -350,6 +372,7 @@ impl Builder {
             links: self.links,
             code_blocks: self.code_blocks,
             media: self.media,
+            formulas: self.formulas,
         }
     }
 }
@@ -707,11 +730,23 @@ fn render(
             Event::InlineMath(math) => {
                 let rendered = terminal_math(&math);
                 let node = builder.node("inline-math");
-                builder.emit_raw(&rendered, &["markup.raw.inline"], source_range, &node);
+                let output = builder.emit_raw(
+                    &rendered,
+                    &["markup.raw.inline"],
+                    source_range.clone(),
+                    &node,
+                );
+                builder.formulas.push(Formula {
+                    tex: math.to_string(),
+                    display: false,
+                    output,
+                    source: source_range,
+                });
             }
             Event::DisplayMath(math) => {
                 builder.blank_line();
                 let rendered = terminal_math(&math);
+                let start = builder.char_len();
                 let padding = builder
                     .width
                     .saturating_sub(UnicodeWidthStr::width(rendered.as_str()))
@@ -723,7 +758,18 @@ fn render(
                     source_range.clone(),
                     &node,
                 );
-                builder.emit_raw(&rendered, &["markup.raw.block"], source_range, &node);
+                builder.emit_raw(
+                    &rendered,
+                    &["markup.raw.block"],
+                    source_range.clone(),
+                    &node,
+                );
+                builder.formulas.push(Formula {
+                    tex: math.to_string(),
+                    display: true,
+                    output: start..builder.char_len(),
+                    source: source_range.clone(),
+                });
                 builder.blank_line();
             }
             Event::Html(html) | Event::InlineHtml(html) => {
@@ -1200,8 +1246,16 @@ fn render_local_media(
     background: [u8; 3],
     true_color: bool,
     allow_remote: bool,
+    raster_math: bool,
 ) -> SteelMarkdownRender {
     let mut edits = Vec::new();
+    if raster_math {
+        for formula in &render.0.formulas {
+            if let Ok(edit) = raster_math_edit(formula, render.0.width, background, true_color) {
+                edits.push(edit);
+            }
+        }
+    }
     let mut remote_count = 0;
     for media in &render.0.media {
         if !media.resolved {
@@ -1227,6 +1281,192 @@ fn render_local_media(
         }));
     }
     SteelMarkdownRender(Arc::new(apply_media_edits(render.0.as_ref(), edits)))
+}
+
+fn raster_math_edit(
+    formula: &Formula,
+    render_width: usize,
+    background: [u8; 3],
+    true_color: bool,
+) -> anyhow::Result<MediaEdit> {
+    anyhow::ensure!(
+        formula.tex.len() <= MAX_TEX_BYTES,
+        "formula exceeds TeX byte limit"
+    );
+    let key = format!("{}:{}", formula.display, formula.tex);
+    let png = cached_math_png(&key).unwrap_or_else(|| Arc::new(Vec::new()));
+    let png = if png.is_empty() {
+        let generated = Arc::new(generate_math_png(formula)?);
+        cache_math_png(key, generated.clone());
+        generated
+    } else {
+        png
+    };
+
+    let mut reader = ImageReader::new(std::io::Cursor::new(png.as_ref())).with_guessed_format()?;
+    reader.limits(media_limits());
+    let image = reader.decode()?.to_rgba8();
+    let max_height = if formula.display { 40 } else { 2 };
+    let image = imageops::thumbnail(
+        &image,
+        render_width.clamp(MIN_WIDTH, MAX_WIDTH) as u32,
+        max_height,
+    );
+    let cells = image.width() as usize * image.height().div_ceil(2) as usize;
+    anyhow::ensure!(cells <= MAX_MEDIA_CELLS, "raster math exceeds cell limit");
+
+    let mut text = String::new();
+    let mut styles = Vec::with_capacity(cells);
+    let padding = if formula.display {
+        render_width.saturating_sub(image.width() as usize) / 2
+    } else {
+        0
+    };
+    for y in (0..image.height()).step_by(2) {
+        text.push_str(&" ".repeat(padding));
+        for x in 0..image.width() {
+            let top = composite(image.get_pixel(x, y), background);
+            let bottom = if y + 1 < image.height() {
+                composite(image.get_pixel(x, y + 1), background)
+            } else {
+                background
+            };
+            let start = text.chars().count();
+            text.push('▀');
+            styles.push(StyledRange {
+                range: start..start + 1,
+                style: RenderStyle::Concrete(
+                    Style::default()
+                        .fg(terminal_color(top, true_color))
+                        .bg(terminal_color(bottom, true_color)),
+                ),
+            });
+        }
+        if formula.display {
+            text.push('\n');
+        }
+    }
+    Ok(MediaEdit {
+        range: formula.output.clone(),
+        text,
+        styles,
+    })
+}
+
+fn cached_math_png(key: &str) -> Option<Arc<Vec<u8>>> {
+    MATH_CACHE
+        .get_or_init(|| Mutex::new(MathCache::default()))
+        .lock()
+        .ok()?
+        .entries
+        .get(key)
+        .cloned()
+}
+
+fn cache_math_png(key: String, png: Arc<Vec<u8>>) {
+    let Ok(mut cache) = MATH_CACHE
+        .get_or_init(|| Mutex::new(MathCache::default()))
+        .lock()
+    else {
+        return;
+    };
+    if png.len() > MAX_MATH_CACHE_BYTES {
+        return;
+    }
+    if cache.bytes + png.len() > MAX_MATH_CACHE_BYTES {
+        cache.entries.clear();
+        cache.bytes = 0;
+    }
+    cache.bytes += png.len();
+    cache.entries.insert(key, png);
+}
+
+fn generate_math_png(formula: &Formula) -> anyhow::Result<Vec<u8>> {
+    let directory = tempfile::Builder::new()
+        .prefix("helix-markdown-math-")
+        .tempdir()?;
+    let expression = if formula.display {
+        format!("\\[{}\\]", formula.tex)
+    } else {
+        format!("${}$", formula.tex)
+    };
+    let document = format!(
+        "\\documentclass{{article}}\n\\usepackage[active,tightpage]{{preview}}\n\\usepackage{{amsmath,amssymb}}\n\\pagestyle{{empty}}\n\\begin{{document}}\n\\begin{{preview}}\n{expression}\n\\end{{preview}}\n\\end{{document}}\n"
+    );
+    anyhow::ensure!(
+        document.len() <= MAX_TEX_BYTES + 1024,
+        "TeX document exceeds limit"
+    );
+    let tex = directory.path().join("formula.tex");
+    fs::write(&tex, document)?;
+
+    let latex = bounded_process(
+        "latex",
+        directory.path(),
+        [
+            "-no-shell-escape",
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "formula.tex",
+        ],
+    )
+    .status()?;
+    anyhow::ensure!(latex.success(), "latex failed or timed out");
+    anyhow::ensure!(
+        directory_size(directory.path())? <= MAX_TEX_ARTIFACT_BYTES,
+        "TeX artifacts exceed output limit"
+    );
+
+    let dvipng = bounded_process(
+        "dvipng",
+        directory.path(),
+        [
+            "-T",
+            "tight",
+            "-D",
+            "130",
+            "-bg",
+            "Transparent",
+            "-o",
+            "formula.png",
+            "formula.dvi",
+        ],
+    )
+    .status()?;
+    anyhow::ensure!(dvipng.success(), "dvipng failed or timed out");
+    let png = fs::read(directory.path().join("formula.png"))?;
+    anyhow::ensure!(
+        png.len() as u64 <= MAX_MEDIA_BYTES,
+        "rasterized formula exceeds byte limit"
+    );
+    Ok(png)
+}
+
+fn bounded_process<const N: usize>(program: &str, cwd: &Path, args: [&str; N]) -> Command {
+    let mut command = Command::new("timeout");
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(cwd)
+        .arg("--signal=KILL")
+        .arg("5")
+        .arg(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn directory_size(path: &Path) -> anyhow::Result<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let metadata = entry?.metadata()?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 fn decode_media_edit(
@@ -1580,6 +1820,15 @@ fn apply_media_edits(render: &MarkdownRender, mut edits: Vec<MediaEdit>) -> Mark
             media
         })
         .collect();
+    updated.formulas = render
+        .formulas
+        .iter()
+        .cloned()
+        .map(|mut formula| {
+            formula.output = map_range(&formula.output);
+            formula
+        })
+        .collect();
     updated
 }
 
@@ -1706,6 +1955,19 @@ fn markdown_render_media(render: &SteelMarkdownRender) -> SteelVal {
     }))
 }
 
+fn markdown_render_formulas(render: &SteelMarkdownRender) -> SteelVal {
+    list(render.0.formulas.iter().map(|formula| {
+        list_value(vec![
+            formula.tex.clone().into_steelval().unwrap(),
+            formula.display.into_steelval().unwrap(),
+            integer(formula.output.start),
+            integer(formula.output.end),
+            integer(formula.source.start),
+            integer(formula.source.end),
+        ])
+    }))
+}
+
 fn markdown_render_mappings(render: &SteelMarkdownRender) -> SteelVal {
     list(render.0.mappings.iter().map(|mapping| {
         list_value(vec![
@@ -1734,6 +1996,7 @@ fn markdown_render_local_media_async(
     render: SteelMarkdownRender,
     mode: String,
     allow_remote: bool,
+    raster_math: bool,
     callback: SteelVal,
 ) -> anyhow::Result<()> {
     let mode = MediaMode::parse(&mode)?;
@@ -1742,7 +2005,14 @@ fn markdown_render_local_media_async(
     let rooted = callback.as_rooted();
     let future = async move {
         let render = tokio::task::spawn_blocking(move || {
-            render_local_media(render, mode, background, true_color, allow_remote)
+            render_local_media(
+                render,
+                mode,
+                background,
+                true_color,
+                allow_remote,
+                raster_math,
+            )
         })
         .await
         .map_err(|error| helix_lsp::Error::Other(anyhow::Error::from(error)))?;
@@ -1899,7 +2169,8 @@ pub(super) fn register(module: &mut BuiltInModule) {
         .register_fn("markdown-render-output-for-source", output_for_source)
         .register_fn_with_ctx(CTX, "markdown-render-apply-focused!", apply_focused)
         .register_fn_with_ctx(CTX, "markdown-render-clear-focused!", clear_focused)
-        .register_fn_with_ctx(CTX, "markdown-preview-open-target!", open_target);
+        .register_fn_with_ctx(CTX, "markdown-preview-open-target!", open_target)
+        .register_fn("markdown-render-formulas", markdown_render_formulas);
 }
 
 #[cfg(test)]
@@ -1987,7 +2258,8 @@ mod tests {
             source: 0..4,
         });
         let render = SteelMarkdownRender(Arc::new(builder.finish("![x](sample.png)".into())));
-        let rendered = render_local_media(render, MediaMode::Unicode, [0, 0, 0], true, false);
+        let rendered =
+            render_local_media(render, MediaMode::Unicode, [0, 0, 0], true, false, false);
 
         assert!(rendered.0.text.contains('▀'));
         assert!(rendered.0.styles.iter().any(|style| matches!(
@@ -2043,5 +2315,48 @@ mod tests {
         assert!(command
             .get_envs()
             .any(|(key, value)| key == "PATH" && value.is_some()));
+    }
+
+    #[test]
+    fn latex_process_has_no_shell_escape_and_a_hard_timeout() {
+        let command = bounded_process(
+            "latex",
+            Path::new("/tmp"),
+            ["-no-shell-escape", "formula.tex"],
+        );
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(arguments[0..3], ["--signal=KILL", "5", "latex"]);
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == "-no-shell-escape"));
+        assert!(!arguments.iter().any(|argument| argument == "sh"));
+    }
+
+    #[test]
+    fn trusted_math_rasterizes_when_tools_are_installed() {
+        if !Path::new("/usr/bin/latex").exists() || !Path::new("/usr/bin/dvipng").exists() {
+            return;
+        }
+        let formula = Formula {
+            tex: r"\alpha + x_2".into(),
+            display: false,
+            output: 0..6,
+            source: 0..12,
+        };
+        let edit = raster_math_edit(&formula, 80, [0, 0, 0], true).unwrap();
+        assert!(edit.text.contains('▀'));
+        assert!(edit
+            .styles
+            .iter()
+            .any(|style| matches!(style.style, RenderStyle::Concrete(_))));
+
+        let invalid = Formula {
+            tex: r"\definitelyMissingCommand".into(),
+            ..formula
+        };
+        assert!(generate_math_png(&invalid).is_err());
     }
 }
