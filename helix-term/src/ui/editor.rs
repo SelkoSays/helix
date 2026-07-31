@@ -154,11 +154,13 @@ impl EditorView {
 
             Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
 
+            let mut concrete_highlights = Vec::new();
             text_decorations::custom_text::add_custom_text_annotations(
                 doc,
                 view.id,
                 theme,
                 &mut overlays,
+                &mut concrete_highlights,
                 &mut decorations,
             );
 
@@ -231,6 +233,7 @@ impl EditorView {
                 &text_annotations,
                 syntax_highlighter,
                 overlays,
+                concrete_highlights,
                 theme,
                 decorations,
             );

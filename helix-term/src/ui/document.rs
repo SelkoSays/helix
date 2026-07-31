@@ -14,6 +14,7 @@ use helix_view::view::ViewPosition;
 use helix_view::{Document, Theme};
 use tui::buffer::Buffer as Surface;
 
+use crate::ui::text_decorations::custom_text::ConcreteStyleRange;
 use crate::ui::text_decorations::DecorationManager;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -36,6 +37,7 @@ pub fn render_document(
     doc_annotations: &TextAnnotations,
     syntax_highlighter: Option<Highlighter<'_>>,
     overlay_highlights: Vec<syntax::OverlayHighlights>,
+    concrete_highlights: Vec<ConcreteStyleRange>,
     theme: &Theme,
     decorations: DecorationManager,
 ) {
@@ -55,6 +57,7 @@ pub fn render_document(
         doc_annotations,
         syntax_highlighter,
         overlay_highlights,
+        concrete_highlights,
         theme,
         decorations,
     )
@@ -69,6 +72,7 @@ pub fn render_text(
     text_annotations: &TextAnnotations,
     syntax_highlighter: Option<Highlighter<'_>>,
     overlay_highlights: Vec<syntax::OverlayHighlights>,
+    concrete_highlights: Vec<ConcreteStyleRange>,
     theme: &Theme,
     mut decorations: DecorationManager,
 ) {
@@ -81,6 +85,7 @@ pub fn render_text(
     let mut syntax_highlighter =
         SyntaxHighlighter::new(syntax_highlighter, text, theme, renderer.text_style);
     let mut overlay_highlighter = OverlayHighlighter::new(overlay_highlights, theme);
+    let mut concrete_highlighter = ConcreteStyleHighlighter::new(concrete_highlights);
 
     let mut last_line_pos = LinePos {
         first_visual_line: false,
@@ -139,6 +144,7 @@ pub fn render_text(
         while grapheme.char_idx >= overlay_highlighter.pos {
             overlay_highlighter.advance();
         }
+        concrete_highlighter.advance_to(grapheme.char_idx);
 
         let grapheme_style = if let GraphemeSource::VirtualText { highlight } = grapheme.source {
             let mut style = renderer.text_style;
@@ -152,7 +158,7 @@ pub fn render_text(
         } else {
             GraphemeStyle {
                 syntax_style: syntax_highlighter.style,
-                overlay_style: overlay_highlighter.style,
+                overlay_style: overlay_highlighter.style.patch(concrete_highlighter.style),
             }
         };
         decorations.decorate_grapheme(renderer, &grapheme);
@@ -171,6 +177,42 @@ pub fn render_text(
 
     renderer.draw_indent_guides(last_line_indent_level, last_line_pos.visual_line);
     decorations.render_virtual_lines(renderer, last_line_pos, last_line_end)
+}
+
+struct ConcreteStyleHighlighter {
+    ranges: Vec<ConcreteStyleRange>,
+    next: usize,
+    active: Vec<(usize, Style)>,
+    style: Style,
+}
+
+impl ConcreteStyleHighlighter {
+    fn new(mut ranges: Vec<ConcreteStyleRange>) -> Self {
+        ranges.sort_by_key(|range| (range.range.start, range.range.end));
+        Self {
+            ranges,
+            next: 0,
+            active: Vec::new(),
+            style: Style::default(),
+        }
+    }
+
+    fn advance_to(&mut self, position: usize) {
+        self.active.retain(|(end, _)| *end > position);
+        while let Some(range) = self.ranges.get(self.next) {
+            if range.range.start > position {
+                break;
+            }
+            if range.range.end > position {
+                self.active.push((range.range.end, range.style));
+            }
+            self.next += 1;
+        }
+        self.style = self
+            .active
+            .iter()
+            .fold(Style::default(), |style, (_, next)| style.patch(*next));
+    }
 }
 
 #[derive(Debug)]

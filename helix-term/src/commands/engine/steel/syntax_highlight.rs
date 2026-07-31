@@ -68,7 +68,7 @@ fn highlight_spans(cx: &mut Context, text: String, language: String) -> SteelVal
     SteelVal::ListV(spans(cx, &text, &language).into())
 }
 
-fn spans(cx: &mut Context, text: &str, language: &str) -> Vec<SteelVal> {
+pub(super) fn spans(cx: &mut Context, text: &str, language: &str) -> Vec<SteelVal> {
     // Refuse before parsing rather than after: the budget exists to bound work,
     // not to bound the result.
     if text.len() > HIGHLIGHT_BYTE_BUDGET {

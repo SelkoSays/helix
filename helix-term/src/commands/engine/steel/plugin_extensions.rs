@@ -9,6 +9,8 @@ use steel::steel_vm::builtin::BuiltInModule;
 
 // Declared here rather than in the Steel `mod.rs` so the whole extension
 // surface stays behind this one registrar.
+#[path = "markdown_preview.rs"]
+mod markdown_preview;
 #[path = "regex.rs"]
 mod regex;
 #[path = "syntax_highlight.rs"]
@@ -201,12 +203,26 @@ fn register_regex(engine: &mut Engine, generate_sources: bool) {
     engine.register_module(module);
 }
 
+fn register_markdown_preview(engine: &mut Engine, generate_sources: bool) {
+    let mut module = BuiltInModule::new("helix/core/markdown-preview");
+    markdown_preview::register(&mut module);
+
+    let source = include_str!("markdown-preview.scm");
+    if generate_sources {
+        generate_module("markdown-preview.scm", source);
+        configure_lsp_builtins("markdown-preview", &module);
+    }
+    engine.register_steel_module("helix/markdown-preview.scm".to_string(), source.to_string());
+    engine.register_module(module);
+}
+
 pub(super) fn register_builtin(engine: &mut Engine, generate_sources: bool) {
     register_view_layout(engine, generate_sources);
     register_external_diagnostics(engine, generate_sources);
     register_text_display(engine, generate_sources);
     register_syntax_highlight(engine, generate_sources);
     register_regex(engine, generate_sources);
+    register_markdown_preview(engine, generate_sources);
 }
 
 #[cfg(test)]

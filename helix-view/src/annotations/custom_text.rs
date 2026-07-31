@@ -5,6 +5,7 @@ use helix_core::{
     Position,
 };
 
+use crate::graphics::Style;
 use crate::{Document, Theme, ViewId};
 
 #[derive(Clone, Debug, Default)]
@@ -23,7 +24,16 @@ pub struct CustomInlineAnnotation {
 #[derive(Clone, Debug)]
 pub struct CustomHighlight {
     pub range: std::ops::Range<usize>,
-    pub scope: String,
+    pub style: CustomHighlightStyle,
+}
+
+/// A custom highlight may follow a theme scope or carry an already-resolved
+/// style. Concrete styles are used by generated buffers whose spans come from
+/// Helix's syntax highlighter (and by half-block image cells).
+#[derive(Clone, Debug)]
+pub enum CustomHighlightStyle {
+    Scope(String),
+    Concrete(Style),
 }
 
 #[derive(Clone, Debug)]
