@@ -20,6 +20,8 @@
          markdown-render-clear-focused!
          markdown-render-view-anchor
          markdown-render-set-view-anchor!
+         markdown-render-ensure-visible!
+         markdown-preview-pin-focused!
          markdown-preview-copy-text!
          markdown-preview-open-target!)
 
@@ -78,6 +80,14 @@
 ;; can be put back exactly where the reader left it.
 (define markdown-render-view-anchor helix.markdown-render-view-anchor)
 (define markdown-render-set-view-anchor! helix.markdown-render-set-view-anchor!)
+
+;; Scroll the focused view so its cursor is visible, with scrolloff honoured.
+;; Pass true to centre instead, for deliberate long jumps.
+(define markdown-render-ensure-visible! helix.markdown-render-ensure-visible!)
+
+;; Keep the focused buffer even though it is unmodified and pathless, which
+;; `Action::Replace` otherwise reads as a disposable scratch buffer.
+(define markdown-preview-pin-focused! helix.markdown-preview-pin-focused!)
 
 ;; Write a string to the default yank register.
 (define markdown-preview-copy-text! helix.markdown-preview-copy-text!)
