@@ -7,6 +7,7 @@
          markdown-render-styles
          markdown-render-headings
          markdown-render-links
+         markdown-render-link-at-output
          markdown-render-code-blocks
          markdown-render-media
          markdown-render-mappings
@@ -47,6 +48,9 @@
 ;; Link rows are `(label destination resolved? output-start output-end
 ;; source-start source-end)`.
 (define markdown-render-links helix.markdown-render-links)
+
+;; Return the link row containing an output character, or `#false`.
+(define markdown-render-link-at-output helix.markdown-render-link-at-output)
 
 ;; Code rows are `(language exact-text output-start output-end source-start
 ;; source-end)`.

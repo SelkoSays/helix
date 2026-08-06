@@ -84,8 +84,8 @@ pub fn render_text(
         DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, text_annotations, anchor);
     let mut syntax_highlighter =
         SyntaxHighlighter::new(syntax_highlighter, text, theme, renderer.text_style);
-    let mut overlay_highlighter = OverlayHighlighter::new(overlay_highlights, theme);
-    let mut concrete_highlighter = ConcreteStyleHighlighter::new(concrete_highlights);
+    let mut overlay_highlighter = OverlayHighlighter::new_at(overlay_highlights, theme, anchor);
+    let mut concrete_highlighter = ConcreteStyleHighlighter::new_at(concrete_highlights, anchor);
 
     let mut last_line_pos = LinePos {
         first_visual_line: false,
@@ -187,12 +187,18 @@ struct ConcreteStyleHighlighter {
 }
 
 impl ConcreteStyleHighlighter {
-    fn new(mut ranges: Vec<ConcreteStyleRange>) -> Self {
+    fn new_at(mut ranges: Vec<ConcreteStyleRange>, position: usize) -> Self {
         ranges.sort_by_key(|range| (range.range.start, range.range.end));
+        let next = ranges.partition_point(|range| range.range.start <= position);
+        let active = ranges[..next]
+            .iter()
+            .filter(|range| range.range.end > position)
+            .map(|range| (range.range.end, range.style))
+            .collect();
         Self {
             ranges,
-            next: 0,
-            active: Vec::new(),
+            next,
+            active,
             style: Style::default(),
         }
     }
@@ -587,8 +593,8 @@ struct OverlayHighlighter<'t> {
 }
 
 impl<'t> OverlayHighlighter<'t> {
-    fn new(overlays: Vec<OverlayHighlights>, theme: &'t Theme) -> Self {
-        let inner = syntax::OverlayHighlighter::new(overlays);
+    fn new_at(overlays: Vec<OverlayHighlights>, theme: &'t Theme, position: usize) -> Self {
+        let inner = syntax::OverlayHighlighter::new_at(overlays, position);
         let mut highlighter = Self {
             inner,
             pos: 0,
