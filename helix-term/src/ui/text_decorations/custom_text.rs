@@ -57,12 +57,19 @@ pub(in crate::ui) fn add_custom_text_annotations<'a>(
         return;
     };
 
+    let mut scoped: Vec<(helix_core::syntax::Highlight, Vec<std::ops::Range<usize>>)> = Vec::new();
     for annotations in namespaces.values() {
         for highlight in &annotations.highlights {
             match &highlight.style {
                 CustomHighlightStyle::Scope(scope) => {
                     if let Some(scope) = theme.find_highlight(scope) {
-                        overlays.push(OverlayHighlights::single(scope, highlight.range.clone()));
+                        if let Some((_, ranges)) =
+                            scoped.iter_mut().find(|(existing, _)| *existing == scope)
+                        {
+                            ranges.push(highlight.range.clone());
+                        } else {
+                            scoped.push((scope, vec![highlight.range.clone()]));
+                        }
                     }
                 }
                 CustomHighlightStyle::Concrete(style) => concrete.push(ConcreteStyleRange {
@@ -71,6 +78,13 @@ pub(in crate::ui) fn add_custom_text_annotations<'a>(
                 }),
             }
         }
+    }
+
+    for (highlight, ranges) in scoped {
+        overlays.push(OverlayHighlights::Homogeneous {
+            highlight,
+            ranges: merge_ranges(ranges),
+        });
     }
 
     let virtual_lines = namespaces
@@ -82,5 +96,33 @@ pub(in crate::ui) fn add_custom_text_annotations<'a>(
             lines: virtual_lines,
             theme,
         });
+    }
+}
+
+fn merge_ranges(mut ranges: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = merged.last_mut() {
+            if range.start <= previous.end {
+                previous.end = previous.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_ranges;
+
+    #[test]
+    fn equal_styles_are_sorted_and_coalesced() {
+        assert_eq!(
+            merge_ranges(vec![20..25, 0..5, 4..12, 12..15]),
+            vec![0..15, 20..25]
+        );
     }
 }

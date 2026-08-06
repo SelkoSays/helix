@@ -898,10 +898,18 @@ struct Overlay {
 }
 
 impl Overlay {
-    fn new(highlights: OverlayHighlights) -> Option<Self> {
+    fn new_at(highlights: OverlayHighlights, position: usize) -> Option<Self> {
+        let idx = match &highlights {
+            OverlayHighlights::Homogeneous { ranges, .. } => {
+                ranges.partition_point(|range| range.end <= position)
+            }
+            OverlayHighlights::Heterogenous { highlights } => {
+                highlights.partition_point(|(_, range)| range.end <= position)
+            }
+        };
         (!highlights.is_empty()).then_some(Self {
             highlights,
-            idx: 0,
+            idx,
             active_highlight: None,
         })
     }
@@ -937,7 +945,17 @@ pub struct OverlayHighlighter {
 
 impl OverlayHighlighter {
     pub fn new(overlays: impl IntoIterator<Item = OverlayHighlights>) -> Self {
-        let overlays: Vec<_> = overlays.into_iter().filter_map(Overlay::new).collect();
+        Self::new_at(overlays, 0)
+    }
+
+    /// Construct an overlay cursor close to `position`, skipping ranges which
+    /// end before the rendered viewport. Ranges in each overlay must be sorted
+    /// and non-overlapping, as required by [`OverlayHighlights`].
+    pub fn new_at(overlays: impl IntoIterator<Item = OverlayHighlights>, position: usize) -> Self {
+        let overlays: Vec<_> = overlays
+            .into_iter()
+            .filter_map(|overlay| Overlay::new_at(overlay, position))
+            .collect();
         let next_highlight_start = overlays
             .iter()
             .filter_map(|overlay| overlay.start())
@@ -1458,5 +1476,24 @@ mod test {
             0,
             source.len(),
         );
+    }
+
+    #[test]
+    fn overlay_highlighter_seeks_to_the_viewport_anchor() {
+        let highlight = Highlight::new(7);
+        let mut highlighter = OverlayHighlighter::new_at(
+            [OverlayHighlights::Homogeneous {
+                highlight,
+                ranges: vec![0..10, 100..110, 800..950, 1000..1010],
+            }],
+            900,
+        );
+
+        // The two ranges before the anchor are skipped. The range spanning the
+        // anchor is activated once, without replaying either earlier range.
+        assert_eq!(highlighter.next_event_offset(), 800);
+        let (_, active) = highlighter.advance();
+        assert_eq!(active.collect::<Vec<_>>(), vec![highlight]);
+        assert_eq!(highlighter.next_event_offset(), 950);
     }
 }

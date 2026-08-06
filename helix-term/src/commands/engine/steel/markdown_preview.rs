@@ -146,6 +146,8 @@ struct MarkdownRender {
     width: usize,
     styles: Vec<StyledRange>,
     mappings: Vec<SourceMap>,
+    output_mapping_index: MappingIndex,
+    source_mapping_index: MappingIndex,
     anchors: HashMap<String, usize>,
     headings: Vec<Heading>,
     links: Vec<Link>,
@@ -153,6 +155,42 @@ struct MarkdownRender {
     media: Vec<Media>,
     formulas: Vec<Formula>,
     kitty_ids: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MappingIndex {
+    by_start: Vec<usize>,
+    by_end: Vec<usize>,
+    prefix_max_end: Vec<usize>,
+}
+
+impl MappingIndex {
+    fn new(mappings: &[SourceMap], output: bool) -> Self {
+        let range = |index: usize| mapping_range(&mappings[index], output);
+        let mut by_start = (0..mappings.len()).collect::<Vec<_>>();
+        by_start.sort_by_key(|index| (range(*index).start, range(*index).end, *index));
+        let mut prefix_max_end = Vec::with_capacity(by_start.len());
+        let mut maximum = 0;
+        for index in &by_start {
+            maximum = maximum.max(range(*index).end);
+            prefix_max_end.push(maximum);
+        }
+        let mut by_end = (0..mappings.len()).collect::<Vec<_>>();
+        by_end.sort_by_key(|index| (range(*index).end, *index));
+        Self {
+            by_start,
+            by_end,
+            prefix_max_end,
+        }
+    }
+}
+
+fn mapping_range(mapping: &SourceMap, output: bool) -> &Range<usize> {
+    if output {
+        &mapping.output
+    } else {
+        &mapping.source
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,6 +290,7 @@ struct TableState {
 
 struct Builder {
     text: String,
+    text_chars: usize,
     width: usize,
     column: usize,
     /// Inline runs arrive as separate events, so the whitespace that separates
@@ -279,6 +318,7 @@ impl Builder {
     fn new(width: usize) -> Self {
         Self {
             text: String::new(),
+            text_chars: 0,
             width: width.clamp(MIN_WIDTH, MAX_WIDTH),
             column: 0,
             pending_space: false,
@@ -298,7 +338,7 @@ impl Builder {
     }
 
     fn char_len(&self) -> usize {
-        self.text.chars().count()
+        self.text_chars
     }
 
     fn at_line_start(&self) -> bool {
@@ -308,6 +348,7 @@ impl Builder {
     fn newline(&mut self) {
         if !self.text.ends_with('\n') {
             self.text.push('\n');
+            self.text_chars += 1;
         }
         self.column = 0;
         self.pending_space = false;
@@ -317,6 +358,7 @@ impl Builder {
         self.newline();
         if !self.text.ends_with("\n\n") {
             self.text.push('\n');
+            self.text_chars += 1;
         }
         self.column = 0;
         self.pending_space = false;
@@ -332,6 +374,7 @@ impl Builder {
         let value = sanitize_controls(value);
         let start = self.char_len();
         self.text.push_str(&value);
+        self.text_chars += value.chars().count();
         if let Some(last) = value.rsplit('\n').next() {
             self.column = if value.contains('\n') {
                 UnicodeWidthStr::width(last)
@@ -447,20 +490,28 @@ impl Builder {
     fn finish(mut self, source_text: String) -> MarkdownRender {
         while self.text.ends_with("\n\n") {
             self.text.pop();
+            self.text_chars -= 1;
         }
         if !self.text.ends_with('\n') {
             self.text.push('\n');
+            self.text_chars += 1;
         }
         self.styles
             .retain(|span| span.range.end <= self.text.chars().count());
         self.mappings
             .sort_by_key(|mapping| (mapping.output.start, mapping.output.end));
+        self.links
+            .sort_by_key(|link| (link.output.start, link.output.end));
+        let output_mapping_index = MappingIndex::new(&self.mappings, true);
+        let source_mapping_index = MappingIndex::new(&self.mappings, false);
         MarkdownRender {
             text: self.text,
             source_text,
             width: self.width,
             styles: self.styles,
             mappings: self.mappings,
+            output_mapping_index,
+            source_mapping_index,
             anchors: self.anchors,
             headings: self.headings,
             links: self.links,
@@ -2537,6 +2588,8 @@ fn apply_media_edits(render: &MarkdownRender, mut edits: Vec<MediaEdit>) -> Mark
             mapping
         })
         .collect();
+    updated.output_mapping_index = MappingIndex::new(&updated.mappings, true);
+    updated.source_mapping_index = MappingIndex::new(&updated.mappings, false);
     updated.anchors = render
         .anchors
         .iter()
@@ -2679,17 +2732,30 @@ fn markdown_render_headings(render: &SteelMarkdownRender) -> SteelVal {
 }
 
 fn markdown_render_links(render: &SteelMarkdownRender) -> SteelVal {
-    list(render.0.links.iter().map(|link| {
-        list_value(vec![
-            link.label.clone().into_steelval().unwrap(),
-            link.destination.clone().into_steelval().unwrap(),
-            link.resolved.into_steelval().unwrap(),
-            integer(link.output.start),
-            integer(link.output.end),
-            integer(link.source.start),
-            integer(link.source.end),
-        ])
-    }))
+    list(render.0.links.iter().map(link_value))
+}
+
+fn link_value(link: &Link) -> SteelVal {
+    list_value(vec![
+        link.label.clone().into_steelval().unwrap(),
+        link.destination.clone().into_steelval().unwrap(),
+        link.resolved.into_steelval().unwrap(),
+        integer(link.output.start),
+        integer(link.output.end),
+        integer(link.source.start),
+        integer(link.source.end),
+    ])
+}
+
+fn markdown_render_link_at_output(render: &SteelMarkdownRender, output: usize) -> Option<SteelVal> {
+    link_at_output(&render.0.links, output).map(link_value)
+}
+
+fn link_at_output(links: &[Link], output: usize) -> Option<&Link> {
+    let index = links.partition_point(|link| link.output.end <= output);
+    links
+        .get(index)
+        .filter(|link| link.output.contains(&output))
 }
 
 fn markdown_render_code_blocks(render: &SteelMarkdownRender) -> SteelVal {
@@ -2793,33 +2859,86 @@ fn markdown_render_local_media_async(
 }
 
 fn source_for_output(render: &SteelMarkdownRender, output: usize) -> Option<usize> {
-    nearest_mapping(&render.0.mappings, output, true)
+    nearest_mapping(
+        &render.0.mappings,
+        &render.0.output_mapping_index,
+        output,
+        true,
+    )
 }
 
 fn output_for_source(render: &SteelMarkdownRender, source: usize) -> Option<usize> {
-    nearest_mapping(&render.0.mappings, source, false)
+    nearest_mapping(
+        &render.0.mappings,
+        &render.0.source_mapping_index,
+        source,
+        false,
+    )
 }
 
 fn nearest_mapping(
     mappings: &[SourceMap],
+    index: &MappingIndex,
     position: usize,
     output_to_source: bool,
 ) -> Option<usize> {
-    let mapping = mappings.iter().min_by_key(|mapping| {
-        let range = if output_to_source {
-            &mapping.output
-        } else {
-            &mapping.source
-        };
-        if range.contains(&position) {
-            0
-        } else {
-            range
-                .start
-                .abs_diff(position)
-                .min(range.end.abs_diff(position))
+    let start_position = index.by_start.partition_point(|mapping| {
+        mapping_range(&mappings[*mapping], output_to_source).start <= position
+    });
+
+    // Find containing ranges. Source ranges may overlap, so the prefix maximum
+    // lets the backward walk stop as soon as no earlier interval can contain
+    // the position. Ties retain the original mapping order.
+    let mut containing = None;
+    let mut cursor = start_position;
+    while cursor > 0 && index.prefix_max_end[cursor - 1] > position {
+        cursor -= 1;
+        let mapping = index.by_start[cursor];
+        if mapping_range(&mappings[mapping], output_to_source).contains(&position) {
+            containing = Some(containing.map_or(mapping, |current: usize| current.min(mapping)));
         }
-    })?;
+    }
+
+    let mapping_index = if let Some(mapping) = containing {
+        mapping
+    } else {
+        let mut candidates = Vec::with_capacity(2);
+        let end_position = index.by_end.partition_point(|mapping| {
+            mapping_range(&mappings[*mapping], output_to_source).end <= position
+        });
+        if end_position > 0 {
+            let best_end =
+                mapping_range(&mappings[index.by_end[end_position - 1]], output_to_source).end;
+            let first = index.by_end[..end_position].partition_point(|mapping| {
+                mapping_range(&mappings[*mapping], output_to_source).end < best_end
+            });
+            if let Some(mapping) = index.by_end[first..end_position].iter().min() {
+                candidates.push(*mapping);
+            }
+        }
+        if start_position < index.by_start.len() {
+            let best_start =
+                mapping_range(&mappings[index.by_start[start_position]], output_to_source).start;
+            let end = start_position
+                + index.by_start[start_position..].partition_point(|mapping| {
+                    mapping_range(&mappings[*mapping], output_to_source).start == best_start
+                });
+            if let Some(mapping) = index.by_start[start_position..end].iter().min() {
+                candidates.push(*mapping);
+            }
+        }
+        *candidates.iter().min_by_key(|mapping| {
+            let range = mapping_range(&mappings[**mapping], output_to_source);
+            (
+                range
+                    .start
+                    .abs_diff(position)
+                    .min(range.end.abs_diff(position)),
+                **mapping,
+            )
+        })?
+    };
+    let mapping = &mappings[mapping_index];
     let (from, to) = if output_to_source {
         (&mapping.output, &mapping.source)
     } else {
@@ -2990,6 +3109,10 @@ pub(super) fn register(module: &mut BuiltInModule) {
         .register_fn("markdown-render-styles", markdown_render_styles)
         .register_fn("markdown-render-headings", markdown_render_headings)
         .register_fn("markdown-render-links", markdown_render_links)
+        .register_fn(
+            "markdown-render-link-at-output",
+            markdown_render_link_at_output,
+        )
         .register_fn("markdown-render-code-blocks", markdown_render_code_blocks)
         .register_fn("markdown-render-media", markdown_render_media)
         .register_fn("markdown-render-mappings", markdown_render_mappings)
@@ -3278,6 +3401,105 @@ mod tests {
             markdown_render_anchor_output(&render, "missing".into()),
             None
         );
+    }
+
+    #[test]
+    fn builder_tracks_character_offsets_without_rescanning_text() {
+        let mut builder = Builder::new(80);
+        builder.emit_raw("a界", &["ui.text"], 0..2, "text:0");
+        builder.newline();
+        builder.emit_raw("β", &["ui.text"], 2..3, "text:1");
+        assert_eq!(builder.char_len(), 4);
+        let render = builder.finish("a界\nβ".into());
+        assert_eq!(render.text.chars().count(), 5);
+        assert_eq!(render.mappings[1].output, 3..4);
+    }
+
+    #[test]
+    fn indexed_mapping_matches_linear_nearest_semantics() {
+        let mappings = vec![
+            SourceMap {
+                output: 0..4,
+                source: 20..24,
+                node: "first".into(),
+            },
+            SourceMap {
+                output: 8..12,
+                source: 0..10,
+                node: "second".into(),
+            },
+            SourceMap {
+                output: 16..20,
+                source: 5..7,
+                node: "third".into(),
+            },
+        ];
+
+        let linear = |position: usize, output: bool| {
+            let mapping = mappings
+                .iter()
+                .min_by_key(|mapping| {
+                    let range = if output {
+                        &mapping.output
+                    } else {
+                        &mapping.source
+                    };
+                    if range.contains(&position) {
+                        0
+                    } else {
+                        range
+                            .start
+                            .abs_diff(position)
+                            .min(range.end.abs_diff(position))
+                    }
+                })
+                .unwrap();
+            let (from, to) = if output {
+                (&mapping.output, &mapping.source)
+            } else {
+                (&mapping.source, &mapping.output)
+            };
+            let offset = position
+                .saturating_sub(from.start)
+                .min(from.end.saturating_sub(from.start));
+            to.start + offset.min(to.end.saturating_sub(to.start))
+        };
+
+        for output in [true, false] {
+            let index = MappingIndex::new(&mappings, output);
+            for position in 0..32 {
+                assert_eq!(
+                    nearest_mapping(&mappings, &index, position, output),
+                    Some(linear(position, output)),
+                    "position {position}, output={output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn link_lookup_uses_half_open_output_ranges() {
+        let links = vec![
+            Link {
+                label: "first".into(),
+                destination: "one".into(),
+                resolved: true,
+                output: 4..8,
+                source: 0..4,
+            },
+            Link {
+                label: "second".into(),
+                destination: "two".into(),
+                resolved: true,
+                output: 12..16,
+                source: 5..9,
+            },
+        ];
+        assert!(link_at_output(&links, 3).is_none());
+        assert_eq!(link_at_output(&links, 4).unwrap().label, "first");
+        assert_eq!(link_at_output(&links, 7).unwrap().label, "first");
+        assert!(link_at_output(&links, 8).is_none());
+        assert_eq!(link_at_output(&links, 15).unwrap().label, "second");
     }
 
     #[test]
