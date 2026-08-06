@@ -1459,7 +1459,10 @@ fn active_modifier(tags: &[TagEnd]) -> Modifier {
 }
 
 fn active_scopes(tags: &[TagEnd], heading: Option<usize>) -> Vec<String> {
-    let mut scopes = vec!["ui.text".to_string()];
+    // Plain preview text already inherits the document renderer's `ui.text`
+    // style. Emitting it again as an overlay is redundant and lets the base
+    // colour overwrite heading/link/emphasis overlays after style batching.
+    let mut scopes = Vec::new();
     if let Some(level) = heading {
         scopes.push(format!("markup.heading.{level}"));
     }
@@ -3331,6 +3334,16 @@ mod tests {
         assert_eq!(concrete.len(), 1);
         assert!(concrete[0].add_modifier.contains(Modifier::BOLD));
         assert!(concrete[0].fg.is_none() && concrete[0].bg.is_none());
+    }
+
+    #[test]
+    fn semantic_scopes_are_not_overwritten_by_the_base_text_style() {
+        assert!(active_scopes(&[], None).is_empty());
+        assert_eq!(active_scopes(&[], Some(2)), ["markup.heading.2"]);
+        assert_eq!(
+            active_scopes(&[TagEnd::Link], Some(1)),
+            ["markup.heading.1", "markup.link.text"]
+        );
     }
 
     #[test]
