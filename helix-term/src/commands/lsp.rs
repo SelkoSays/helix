@@ -133,6 +133,27 @@ fn jump_to_location(editor: &mut Editor, location: &Location, action: Action) {
     );
 }
 
+/// Open a location retained by a Steel plugin without losing the originating
+/// provider's offset encoding. Keeping the conversion here makes plugin
+/// diagnostics follow the exact same jump path as the native picker.
+pub(crate) fn jump_to_plugin_location(
+    editor: &mut Editor,
+    uri: Uri,
+    range: lsp::Range,
+    offset_encoding: OffsetEncoding,
+    action: Action,
+) {
+    jump_to_location(
+        editor,
+        &Location {
+            uri,
+            range,
+            offset_encoding,
+        },
+        action,
+    );
+}
+
 fn jump_to_position(
     editor: &mut Editor,
     path: &Path,
