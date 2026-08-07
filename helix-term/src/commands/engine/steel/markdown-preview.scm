@@ -1,6 +1,11 @@
 (require-builtin helix/core/markdown-preview as helix.)
 
-(provide markdown-render
+(provide markdown-structure
+         markdown-structure-headings
+         markdown-structure-links
+         markdown-structure-tasks
+         markdown-structure-front-matter
+         markdown-render
          markdown-render-text
          markdown-render-width
          markdown-render-source-unchanged?
@@ -25,6 +30,28 @@
          markdown-preview-pin-focused!
          markdown-preview-copy-text!
          markdown-preview-open-target!)
+
+;;@doc
+;; Parse non-rendering Markdown structure. Source ranges are zero-based,
+;; half-open character offsets. `source-path` is a string or `#false` and is
+;; used only to resolve local destinations; no target is opened.
+(define markdown-structure helix.markdown-structure)
+
+;; Heading rows are `(level title anchor title-start title-end block-start
+;; block-end)`.
+(define markdown-structure-headings helix.markdown-structure-headings)
+
+;; Link rows are `(kind label destination resolved? source-start source-end
+;; destination-start destination-end definition-start definition-end)`. Missing
+;; ranges are `#false`.
+(define markdown-structure-links helix.markdown-structure-links)
+
+;; Task rows are `(checked? marker-start marker-end)`.
+(define markdown-structure-tasks helix.markdown-structure-tasks)
+
+;; Return `#false` or `(format start end keys)`, where each key is
+;; `(name key-start key-end value-start value-end)`.
+(define markdown-structure-front-matter helix.markdown-structure-front-matter)
 
 ;;@doc
 ;; Render Markdown into an opaque native result. `source-path` is a string or

@@ -27,7 +27,8 @@ use image::{
     RgbaImage,
 };
 use pulldown_cmark::{
-    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag,
+    TagEnd,
 };
 use steel::{
     rvals::{AsRefSteelVal, Custom, IntoSteelVal},
@@ -232,6 +233,59 @@ static NEXT_KITTY_ID: AtomicU32 = AtomicU32::new(1);
 struct SteelMarkdownRender(Arc<MarkdownRender>);
 
 impl Custom for SteelMarkdownRender {}
+
+#[derive(Clone, Debug)]
+struct StructureHeading {
+    level: usize,
+    title: String,
+    anchor: String,
+    title_range: Range<usize>,
+    block_range: Range<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct StructureLink {
+    kind: &'static str,
+    label: String,
+    destination: String,
+    resolved: bool,
+    source_range: Range<usize>,
+    destination_range: Option<Range<usize>>,
+    definition_range: Option<Range<usize>>,
+}
+
+#[derive(Clone, Debug)]
+struct StructureTask {
+    checked: bool,
+    marker_range: Range<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct FrontMatterKey {
+    key: String,
+    key_range: Range<usize>,
+    value_range: Range<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct FrontMatter {
+    kind: &'static str,
+    range: Range<usize>,
+    keys: Vec<FrontMatterKey>,
+}
+
+#[derive(Clone, Debug)]
+struct MarkdownStructure {
+    headings: Vec<StructureHeading>,
+    links: Vec<StructureLink>,
+    tasks: Vec<StructureTask>,
+    front_matter: Option<FrontMatter>,
+}
+
+#[derive(Clone)]
+struct SteelMarkdownStructure(Arc<MarkdownStructure>);
+
+impl Custom for SteelMarkdownStructure {}
 
 struct MarkdownCallbackValue(SteelMarkdownRender);
 
@@ -521,6 +575,460 @@ impl Builder {
             kitty_ids: self.kitty_ids,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct ReferenceDefinition {
+    destination: String,
+    span: Range<usize>,
+    destination_range: Option<Range<usize>>,
+}
+
+#[derive(Default)]
+struct StructureHeadingState {
+    level: usize,
+    title: String,
+    title_range: Option<Range<usize>>,
+    block_range: Range<usize>,
+}
+
+struct StructureLinkState {
+    kind: &'static str,
+    label: String,
+    destination: String,
+    resolved: bool,
+    source_range: Range<usize>,
+    destination_range: Option<Range<usize>>,
+    definition_range: Option<Range<usize>>,
+}
+
+fn markdown_structure(source: String, source_path: Option<String>) -> SteelMarkdownStructure {
+    let mut options = Options::ENABLE_GFM;
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    options.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
+
+    let parser = Parser::new_ext(&source, options);
+    let definitions = parser
+        .reference_definitions()
+        .iter()
+        .map(|(label, definition)| {
+            let destination_range = reference_destination_range(&source, definition.span.clone());
+            (
+                label.to_lowercase(),
+                ReferenceDefinition {
+                    destination: definition.dest.to_string(),
+                    span: byte_range_to_chars(&source, definition.span.clone()),
+                    destination_range: destination_range
+                        .map(|range| byte_range_to_chars(&source, range)),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut headings = Vec::new();
+    let mut links = Vec::new();
+    let mut tasks = Vec::new();
+    let mut heading = None::<StructureHeadingState>;
+    let mut link = None::<StructureLinkState>;
+    let mut heading_ids = HashMap::<String, usize>::new();
+
+    for (event, byte_range) in parser.into_offset_iter() {
+        let source_range = byte_range_to_chars(&source, byte_range.clone());
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                heading = Some(StructureHeadingState {
+                    level: heading_level(level),
+                    title: String::new(),
+                    title_range: None,
+                    block_range: source_range,
+                });
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some(mut state) = heading.take() {
+                    state.block_range.end = source_range.end;
+                    let title_range = state
+                        .title_range
+                        .unwrap_or(state.block_range.start..state.block_range.start);
+                    let base = slug(&state.title);
+                    let count = heading_ids.entry(base.clone()).or_default();
+                    let anchor = if *count == 0 {
+                        base
+                    } else {
+                        format!("{base}-{count}")
+                    };
+                    *count += 1;
+                    headings.push(StructureHeading {
+                        level: state.level,
+                        title: state.title,
+                        anchor,
+                        title_range,
+                        block_range: state.block_range,
+                    });
+                }
+            }
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                id,
+                ..
+            }) => {
+                let reference = if is_reference_link(link_type) {
+                    definitions.get(&id.to_lowercase())
+                } else {
+                    None
+                };
+                let raw_destination = reference
+                    .map(|definition| definition.destination.as_str())
+                    .unwrap_or(dest_url.as_ref());
+                let (destination, resolved) =
+                    resolve_destination(raw_destination, source_path.as_deref());
+                let destination_range = reference
+                    .and_then(|definition| definition.destination_range.clone())
+                    .or_else(|| inline_destination_range(&source, byte_range.clone(), link_type))
+                    .map(|range| byte_range_to_chars(&source, range));
+                link = Some(StructureLinkState {
+                    kind: link_kind(link_type),
+                    label: String::new(),
+                    destination,
+                    resolved,
+                    source_range,
+                    destination_range,
+                    definition_range: reference.map(|definition| definition.span.clone()),
+                });
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some(mut state) = link.take() {
+                    state.source_range.end = source_range.end;
+                    links.push(StructureLink {
+                        kind: state.kind,
+                        label: state.label,
+                        destination: state.destination,
+                        resolved: state.resolved,
+                        source_range: state.source_range,
+                        destination_range: state.destination_range,
+                        definition_range: state.definition_range,
+                    });
+                }
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some(state) = heading.as_mut() {
+                    state.title.push_str(&text);
+                    match state.title_range.as_mut() {
+                        Some(range) => range.end = source_range.end,
+                        None => state.title_range = Some(source_range.clone()),
+                    }
+                }
+                if let Some(state) = link.as_mut() {
+                    state.label.push_str(&text);
+                }
+            }
+            Event::TaskListMarker(checked) => tasks.push(StructureTask {
+                checked,
+                marker_range: source_range,
+            }),
+            _ => {}
+        }
+    }
+
+    SteelMarkdownStructure(Arc::new(MarkdownStructure {
+        headings,
+        links,
+        tasks,
+        front_matter: parse_front_matter(&source),
+    }))
+}
+
+fn is_reference_link(link_type: LinkType) -> bool {
+    matches!(
+        link_type,
+        LinkType::Reference
+            | LinkType::ReferenceUnknown
+            | LinkType::Collapsed
+            | LinkType::CollapsedUnknown
+            | LinkType::Shortcut
+            | LinkType::ShortcutUnknown
+    )
+}
+
+fn link_kind(link_type: LinkType) -> &'static str {
+    match link_type {
+        LinkType::Inline => "inline",
+        LinkType::Reference | LinkType::ReferenceUnknown => "reference",
+        LinkType::Collapsed | LinkType::CollapsedUnknown => "collapsed-reference",
+        LinkType::Shortcut | LinkType::ShortcutUnknown => "shortcut-reference",
+        LinkType::Autolink => "autolink",
+        LinkType::Email => "email",
+        LinkType::WikiLink { .. } => "wikilink",
+    }
+}
+
+fn inline_destination_range(
+    source: &str,
+    span: Range<usize>,
+    link_type: LinkType,
+) -> Option<Range<usize>> {
+    let text = source.get(span.clone())?;
+    if matches!(link_type, LinkType::Autolink | LinkType::Email) {
+        let start = text.find('<')? + 1;
+        let end = text.rfind('>')?;
+        return (start <= end).then(|| span.start + start..span.start + end);
+    }
+    if !matches!(link_type, LinkType::Inline) {
+        return None;
+    }
+    let open = find_unescaped(text.as_bytes(), b"](")? + 2;
+    let bytes = text.as_bytes();
+    let mut start = open;
+    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    if bytes.get(start) == Some(&b'<') {
+        let end = find_unescaped_byte(bytes, b'>', start + 1)?;
+        return Some(span.start + start + 1..span.start + end);
+    }
+    let mut end = start;
+    let mut depth = 0usize;
+    let mut escaped = false;
+    while end < bytes.len() {
+        let byte = bytes[end];
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'(' {
+            depth += 1;
+        } else if byte == b')' {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        } else if byte.is_ascii_whitespace() && depth == 0 {
+            break;
+        }
+        end += 1;
+    }
+    (start < end).then(|| span.start + start..span.start + end)
+}
+
+fn reference_destination_range(source: &str, span: Range<usize>) -> Option<Range<usize>> {
+    let text = source.get(span.clone())?;
+    let colon = find_unescaped_byte(text.as_bytes(), b':', 0)?;
+    let bytes = text.as_bytes();
+    let mut start = colon + 1;
+    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    if bytes.get(start) == Some(&b'<') {
+        let end = find_unescaped_byte(bytes, b'>', start + 1)?;
+        return Some(span.start + start + 1..span.start + end);
+    }
+    let mut end = start;
+    let mut escaped = false;
+    while end < bytes.len() {
+        let byte = bytes[end];
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte.is_ascii_whitespace() {
+            break;
+        }
+        end += 1;
+    }
+    (start < end).then(|| span.start + start..span.start + end)
+}
+
+fn find_unescaped(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .find(|(index, value)| {
+            *value == needle && (*index == 0 || haystack[index.saturating_sub(1)] != b'\\')
+        })
+        .map(|(index, _)| index)
+}
+
+fn find_unescaped_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate().skip(start) {
+        if escaped {
+            escaped = false;
+        } else if *byte == b'\\' {
+            escaped = true;
+        } else if *byte == needle {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn parse_front_matter(source: &str) -> Option<FrontMatter> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    if source.starts_with("---\n") || source.starts_with("---\r\n") {
+        return parse_delimited_front_matter(source, "---", "yaml", b':');
+    }
+    if source.starts_with("+++\n") || source.starts_with("+++\r\n") {
+        return parse_delimited_front_matter(source, "+++", "toml", b'=');
+    }
+    parse_json_front_matter(source)
+}
+
+fn parse_delimited_front_matter(
+    source: &str,
+    delimiter: &str,
+    kind: &'static str,
+    separator: u8,
+) -> Option<FrontMatter> {
+    let first_end = source.find('\n')? + 1;
+    let mut offset = first_end;
+    let mut end = None;
+    let mut keys = Vec::new();
+    for line in source[first_end..].split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        if content == delimiter || (kind == "yaml" && content == "...") {
+            end = Some(offset + line.len());
+            break;
+        }
+        if !content.starts_with(char::is_whitespace) && !content.starts_with('#') {
+            if let Some(split) = content
+                .as_bytes()
+                .iter()
+                .position(|byte| *byte == separator)
+            {
+                let key_text = content[..split].trim_end();
+                if !key_text.is_empty() {
+                    let key_start = offset + content[..split].find(key_text).unwrap_or(0);
+                    let mut value_start = offset + split + 1;
+                    let line_end = offset + content.len();
+                    while value_start < line_end
+                        && source.as_bytes()[value_start].is_ascii_whitespace()
+                    {
+                        value_start += 1;
+                    }
+                    keys.push(FrontMatterKey {
+                        key: key_text.trim_matches(['\'', '"']).to_string(),
+                        key_range: byte_range_to_chars(
+                            source,
+                            key_start..key_start + key_text.len(),
+                        ),
+                        value_range: byte_range_to_chars(source, value_start..line_end),
+                    });
+                }
+            }
+        }
+        offset += line.len();
+    }
+    Some(FrontMatter {
+        kind,
+        range: byte_range_to_chars(source, 0..end?),
+        keys,
+    })
+}
+
+fn parse_json_front_matter(source: &str) -> Option<FrontMatter> {
+    if !source.starts_with('{') {
+        return None;
+    }
+    let mut stream = serde_json::Deserializer::from_str(source).into_iter::<serde_json::Value>();
+    let value = stream.next()?.ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let end = stream.byte_offset();
+    let mut keys = Vec::new();
+    let bytes = &source.as_bytes()[..end];
+    let mut index = 1usize;
+    let mut depth = 1usize;
+    while index < bytes.len() && depth > 0 {
+        match bytes[index] {
+            b'"' => {
+                let string_start = index;
+                index += 1;
+                let mut escaped = false;
+                while index < bytes.len() {
+                    if escaped {
+                        escaped = false;
+                    } else if bytes[index] == b'\\' {
+                        escaped = true;
+                    } else if bytes[index] == b'"' {
+                        break;
+                    }
+                    index += 1;
+                }
+                let string_end = index;
+                index += 1;
+                if depth == 1 {
+                    let mut colon = index;
+                    while colon < bytes.len() && bytes[colon].is_ascii_whitespace() {
+                        colon += 1;
+                    }
+                    if bytes.get(colon) == Some(&b':') {
+                        let raw = &source[string_start..=string_end];
+                        let key = serde_json::from_str::<String>(raw).ok()?;
+                        let mut value_start = colon + 1;
+                        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace()
+                        {
+                            value_start += 1;
+                        }
+                        let value_end = json_value_end(bytes, value_start)?;
+                        keys.push(FrontMatterKey {
+                            key,
+                            key_range: byte_range_to_chars(source, string_start + 1..string_end),
+                            value_range: byte_range_to_chars(source, value_start..value_end),
+                        });
+                    }
+                }
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    Some(FrontMatter {
+        kind: "json",
+        range: byte_range_to_chars(source, 0..end),
+        keys,
+    })
+}
+
+fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    let mut depth = 0usize;
+    let mut string = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                string = false;
+            }
+        } else {
+            match byte {
+                b'"' => string = true,
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' if depth > 0 => depth -= 1,
+                b',' | b'}' if depth == 0 => break,
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    (index >= start).then_some(index)
 }
 
 fn render(
@@ -2692,6 +3200,73 @@ fn markdown_render_text(render: &SteelMarkdownRender) -> String {
     render.0.text.clone()
 }
 
+fn markdown_structure_headings(structure: &SteelMarkdownStructure) -> SteelVal {
+    list(structure.0.headings.iter().map(|heading| {
+        list([
+            integer(heading.level),
+            heading.title.clone().into_steelval().unwrap(),
+            heading.anchor.clone().into_steelval().unwrap(),
+            integer(heading.title_range.start),
+            integer(heading.title_range.end),
+            integer(heading.block_range.start),
+            integer(heading.block_range.end),
+        ])
+    }))
+}
+
+fn optional_integer(value: Option<usize>) -> SteelVal {
+    value
+        .map(integer)
+        .unwrap_or_else(|| false.into_steelval().unwrap())
+}
+
+fn markdown_structure_links(structure: &SteelMarkdownStructure) -> SteelVal {
+    list(structure.0.links.iter().map(|link| {
+        list([
+            link.kind.into_steelval().unwrap(),
+            link.label.clone().into_steelval().unwrap(),
+            link.destination.clone().into_steelval().unwrap(),
+            link.resolved.into_steelval().unwrap(),
+            integer(link.source_range.start),
+            integer(link.source_range.end),
+            optional_integer(link.destination_range.as_ref().map(|range| range.start)),
+            optional_integer(link.destination_range.as_ref().map(|range| range.end)),
+            optional_integer(link.definition_range.as_ref().map(|range| range.start)),
+            optional_integer(link.definition_range.as_ref().map(|range| range.end)),
+        ])
+    }))
+}
+
+fn markdown_structure_tasks(structure: &SteelMarkdownStructure) -> SteelVal {
+    list(structure.0.tasks.iter().map(|task| {
+        list([
+            task.checked.into_steelval().unwrap(),
+            integer(task.marker_range.start),
+            integer(task.marker_range.end),
+        ])
+    }))
+}
+
+fn markdown_structure_front_matter(structure: &SteelMarkdownStructure) -> SteelVal {
+    let Some(front_matter) = structure.0.front_matter.as_ref() else {
+        return false.into_steelval().unwrap();
+    };
+    list([
+        front_matter.kind.into_steelval().unwrap(),
+        integer(front_matter.range.start),
+        integer(front_matter.range.end),
+        list(front_matter.keys.iter().map(|key| {
+            list([
+                key.key.clone().into_steelval().unwrap(),
+                integer(key.key_range.start),
+                integer(key.key_range.end),
+                integer(key.value_range.start),
+                integer(key.value_range.end),
+            ])
+        })),
+    ])
+}
+
 fn markdown_render_width(render: &SteelMarkdownRender) -> usize {
     render.0.width
 }
@@ -3102,6 +3677,14 @@ fn list(values: impl IntoIterator<Item = SteelVal>) -> SteelVal {
 
 pub(super) fn register(module: &mut BuiltInModule) {
     module
+        .register_fn("markdown-structure", markdown_structure)
+        .register_fn("markdown-structure-headings", markdown_structure_headings)
+        .register_fn("markdown-structure-links", markdown_structure_links)
+        .register_fn("markdown-structure-tasks", markdown_structure_tasks)
+        .register_fn(
+            "markdown-structure-front-matter",
+            markdown_structure_front_matter,
+        )
         .register_fn_with_ctx(CTX, "markdown-render", render)
         .register_fn("markdown-render-text", markdown_render_text)
         .register_fn("markdown-render-width", markdown_render_width)
@@ -3155,6 +3738,55 @@ mod tests {
         let mut builder = Builder::new(80);
         assert_eq!(builder.unique_anchor("Hello, World!"), "hello-world");
         assert_eq!(builder.unique_anchor("Hello, World!"), "hello-world-1");
+    }
+
+    #[test]
+    fn structure_uses_character_ranges_and_deduplicated_anchors() {
+        let source = "é\n\n# Héllo\n\n# Héllo\n";
+        let structure = markdown_structure(source.into(), None);
+        assert_eq!(structure.0.headings.len(), 2);
+        assert_eq!(structure.0.headings[0].title, "Héllo");
+        assert_eq!(structure.0.headings[0].anchor, "héllo");
+        assert_eq!(structure.0.headings[0].title_range, 5..10);
+        assert_eq!(structure.0.headings[1].anchor, "héllo-1");
+    }
+
+    #[test]
+    fn structure_reports_inline_and_reference_destination_ranges() {
+        let source = "[inline](docs/a.md#one) [ref][id]\n\n[id]: <docs/b.md#two>\n";
+        let structure = markdown_structure(source.into(), Some("/tmp/readme.md".into()));
+        assert_eq!(structure.0.links.len(), 2);
+        let inline = &structure.0.links[0];
+        assert_eq!(
+            &source[inline.destination_range.clone().unwrap()],
+            "docs/a.md#one"
+        );
+        let reference = &structure.0.links[1];
+        assert_eq!(reference.kind, "reference");
+        assert_eq!(
+            &source[reference.destination_range.clone().unwrap()],
+            "docs/b.md#two"
+        );
+        assert!(reference.definition_range.is_some());
+    }
+
+    #[test]
+    fn structure_reports_task_markers_and_inert_front_matter() {
+        let source = "---\ntitle: Example\nrun: $(touch /tmp/nope)\n---\n\n- [x] done\n";
+        let structure = markdown_structure(source.into(), None);
+        let front_matter = structure.0.front_matter.as_ref().unwrap();
+        assert_eq!(front_matter.kind, "yaml");
+        assert_eq!(
+            front_matter
+                .keys
+                .iter()
+                .map(|key| key.key.as_str())
+                .collect::<Vec<_>>(),
+            ["title", "run"]
+        );
+        assert_eq!(structure.0.tasks.len(), 1);
+        assert!(structure.0.tasks[0].checked);
+        assert_eq!(&source[structure.0.tasks[0].marker_range.clone()], "[x]");
     }
 
     #[test]
