@@ -687,10 +687,16 @@ fn markdown_structure(source: String, source_path: Option<String>) -> SteelMarkd
                     .unwrap_or(dest_url.as_ref());
                 let (destination, resolved) =
                     resolve_destination(raw_destination, source_path.as_deref());
+                // Reference metadata was normalized to character offsets when
+                // the definition table was built. Inline destinations still
+                // come directly from pulldown-cmark byte spans. Converting the
+                // former a second time shifts every definition after Unicode.
                 let destination_range = reference
                     .and_then(|definition| definition.destination_range.clone())
-                    .or_else(|| inline_destination_range(&source, byte_range.clone(), link_type))
-                    .map(|range| byte_range_to_chars(&source, range));
+                    .or_else(|| {
+                        inline_destination_range(&source, byte_range.clone(), link_type)
+                            .map(|range| byte_range_to_chars(&source, range))
+                    });
                 link = Some(StructureLinkState {
                     kind: link_kind(link_type),
                     label: String::new(),
@@ -3768,6 +3774,21 @@ mod tests {
             "docs/b.md#two"
         );
         assert!(reference.definition_range.is_some());
+    }
+
+    #[test]
+    fn structure_reference_ranges_remain_exact_after_unicode() {
+        let source = "[inline](guide.md#héllo)\n[ref][id]\n\n[id]: guide.md#héllo\n";
+        let structure = markdown_structure(source.into(), Some("/tmp/readme.md".into()));
+        let reference = &structure.0.links[1];
+        assert_eq!(
+            char_slice(source, reference.destination_range.clone().unwrap()),
+            "guide.md#héllo"
+        );
+        assert_eq!(
+            char_slice(source, reference.definition_range.clone().unwrap()),
+            "[id]: guide.md#héllo"
+        );
     }
 
     #[test]
