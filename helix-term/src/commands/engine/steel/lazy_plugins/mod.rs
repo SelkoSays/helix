@@ -1,10 +1,12 @@
 use std::{borrow::Cow, collections::HashMap};
 
 mod activation;
+mod discovery;
 mod precompile;
 mod state;
 
 use activation::*;
+use discovery::*;
 pub(super) use precompile::finish_initialization;
 use precompile::*;
 use state::*;
@@ -168,6 +170,26 @@ fn register_async_lazy_plugin(
     )
 }
 
+fn discover_lazy_commands(sources: Vec<String>) -> Result<HashMap<String, String>, SteelErr> {
+    discover_commands(&sources)
+}
+
+fn register_discovered_lazy_plugin(
+    name: String,
+    modules: Vec<String>,
+    initializers: Vec<String>,
+    sources: Vec<String>,
+) -> Result<(), SteelErr> {
+    let command_docs = discover_commands(&sources)?;
+    register_plugin(
+        name,
+        modules,
+        initializers,
+        command_docs,
+        RegistrationKind::Lazy,
+    )
+}
+
 fn command_doc(command: String) -> Option<String> {
     documentation(&command)
 }
@@ -178,6 +200,11 @@ pub(super) fn register_builtin(engine: &mut Engine, generate_sources: bool) {
     module
         .register_fn("#%register-lazy-plugin!", register_lazy_plugin)
         .register_fn("#%register-async-lazy-plugin!", register_async_lazy_plugin)
+        .register_fn("#%discover-lazy-commands", discover_lazy_commands)
+        .register_fn(
+            "#%register-discovered-lazy-plugin!",
+            register_discovered_lazy_plugin,
+        )
         .register_fn("lazy-plugin-command-doc", command_doc);
 
     if generate_sources {
@@ -198,6 +225,7 @@ pub(super) fn reset(generation: usize) {
     condvar.notify_all();
     drop(registry);
     *LOADER.lock().unwrap() = None;
+    reset_discovery_cache();
 }
 
 fn set_command_result(cx: &mut Context, result: &SteelVal) {

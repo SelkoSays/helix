@@ -10,7 +10,8 @@
          deep-copy-global-keybindings
          keymap
          query-keymap
-         query-global-keymap)
+         query-global-keymap
+         flatten-keymap)
 
 (define (get-doc name)
   ;; Do our best - if the identifier doesn't exist (for example, if we're checking)
@@ -67,6 +68,7 @@
                                                                                (list-ref p 1))))))
 
 (define query-keymap helix.keymaps.query-keymap)
+(define flatten-keymap helix.keymaps.flatten-keymap)
 
 ;;@doc
 ;; Query the global keybindings.
