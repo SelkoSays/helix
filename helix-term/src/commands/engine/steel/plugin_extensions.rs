@@ -3,7 +3,7 @@ use crate::commands::engine::steel::Context;
 use helix_core::diagnostic::Severity;
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::editor::ExternalDiagnostic;
-use helix_view::tree::TemporaryLayoutToken;
+use helix_view::tree::{ResizeAxis, TemporaryLayoutToken};
 use std::{path::PathBuf, sync::Arc};
 use steel::steel_vm::builtin::BuiltInModule;
 
@@ -62,6 +62,19 @@ fn temporary_layout_restore(
     cx.editor.restore_temporary_layout(token.0)
 }
 
+fn view_resize(cx: &mut Context, axis: String, delta: i32) -> anyhow::Result<i32> {
+    let axis = match axis.as_str() {
+        "width" => ResizeAxis::Width,
+        "height" => ResizeAxis::Height,
+        _ => anyhow::bail!("view resize axis must be width or height"),
+    };
+    Ok(cx.editor.tree.resize_focused(axis, delta))
+}
+
+fn view_equalize(cx: &mut Context) -> bool {
+    cx.editor.tree.equalize_focused()
+}
+
 fn register_view_layout(engine: &mut Engine, generate_sources: bool) {
     let mut module = BuiltInModule::new("helix/core/view-layout");
     module
@@ -70,7 +83,9 @@ fn register_view_layout(engine: &mut Engine, generate_sources: bool) {
         .register_fn_with_ctx(CTX, "view-fullscreen-leave!", fullscreen_leave)
         .register_fn_with_ctx(CTX, "view-fullscreen-toggle!", fullscreen_toggle)
         .register_fn_with_ctx(CTX, "temporary-layout-enter!", temporary_layout_enter)
-        .register_fn_with_ctx(CTX, "temporary-layout-restore!", temporary_layout_restore);
+        .register_fn_with_ctx(CTX, "temporary-layout-restore!", temporary_layout_restore)
+        .register_fn_with_ctx(CTX, "view-resize!", view_resize)
+        .register_fn_with_ctx(CTX, "view-equalize!", view_equalize);
 
     let source = include_str!("view-layout.scm");
     if generate_sources {

@@ -5,7 +5,9 @@
          view-fullscreen-leave!
          view-fullscreen-toggle!
          temporary-layout-enter!
-         temporary-layout-restore!)
+         temporary-layout-restore!
+         view-resize!
+         view-equalize!)
 
 ;;@doc
 ;; Return whether an editor view is currently rendered fullscreen.
@@ -31,3 +33,12 @@
 ;;@doc
 ;; Restore the most recently suspended layout identified by token.
 (define temporary-layout-restore! helix.temporary-layout-restore!)
+
+;;@doc
+;; Grow or shrink the focused split branch along width or height by a signed
+;; terminal-cell delta. Return the signed number of cells actually moved.
+(define view-resize! helix.view-resize!)
+
+;;@doc
+;; Restore equal proportions in the focused view's immediate split group.
+(define view-equalize! helix.view-equalize!)
