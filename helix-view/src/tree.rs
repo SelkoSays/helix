@@ -60,6 +60,21 @@ pub enum Layout {
     // could explore stacked/tabbed
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeAxis {
+    Width,
+    Height,
+}
+
+impl ResizeAxis {
+    fn layout(self) -> Layout {
+        match self {
+            Self::Width => Layout::Vertical,
+            Self::Height => Layout::Horizontal,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
     Up,
@@ -72,6 +87,7 @@ pub enum Direction {
 pub struct Container {
     layout: Layout,
     children: Vec<ViewId>,
+    weights: Vec<u32>,
     area: Rect,
 }
 
@@ -80,7 +96,94 @@ impl Container {
         Self {
             layout,
             children: Vec::new(),
+            weights: Vec::new(),
             area: Rect::default(),
+        }
+    }
+
+    fn sync_weights(&mut self) {
+        self.weights.resize(self.children.len(), 1);
+        for weight in &mut self.weights {
+            if *weight == 0 {
+                *weight = 1;
+            }
+        }
+    }
+}
+
+fn extent(area: Rect, layout: Layout) -> u16 {
+    match layout {
+        Layout::Horizontal => area.height,
+        Layout::Vertical => area.width,
+    }
+}
+
+fn weighted_sizes(total: u16, weights: &[u32]) -> Vec<u16> {
+    if weights.is_empty() {
+        return Vec::new();
+    }
+    let weight_sum = weights
+        .iter()
+        .map(|weight| u64::from((*weight).max(1)))
+        .sum::<u64>();
+    let mut used = 0u16;
+    weights
+        .iter()
+        .enumerate()
+        .map(|(index, weight)| {
+            if index == weights.len() - 1 {
+                total.saturating_sub(used)
+            } else {
+                let size = (u64::from(total) * u64::from((*weight).max(1)) / weight_sum)
+                    .min(u64::from(u16::MAX)) as u16;
+                used = used.saturating_add(size);
+                size
+            }
+        })
+        .collect()
+}
+
+fn constrained_weighted_sizes(total: u16, weights: &[u32], minima: &[u16]) -> Vec<u16> {
+    debug_assert_eq!(weights.len(), minima.len());
+    if minima.iter().copied().fold(0u16, u16::saturating_add) > total {
+        return weighted_sizes(total, weights);
+    }
+
+    let mut result = vec![0; weights.len()];
+    let mut active = vec![true; weights.len()];
+    let mut remaining = total;
+
+    loop {
+        let active_indices = active
+            .iter()
+            .enumerate()
+            .filter_map(|(index, active)| active.then_some(index))
+            .collect::<Vec<_>>();
+        if active_indices.is_empty() {
+            return result;
+        }
+        let active_weights = active_indices
+            .iter()
+            .map(|index| weights[*index])
+            .collect::<Vec<_>>();
+        let proposed = weighted_sizes(remaining, &active_weights);
+        let constrained = active_indices
+            .iter()
+            .zip(&proposed)
+            .filter_map(|(index, size)| (*size < minima[*index]).then_some(*index))
+            .collect::<Vec<_>>();
+
+        if constrained.is_empty() {
+            for (index, size) in active_indices.into_iter().zip(proposed) {
+                result[index] = size;
+            }
+            return result;
+        }
+
+        for index in constrained {
+            result[index] = minima[index];
+            remaining = remaining.saturating_sub(minima[index]);
+            active[index] = false;
         }
     }
 }
@@ -141,7 +244,9 @@ impl Tree {
             pos + 1
         };
 
+        container.sync_weights();
         container.children.insert(pos, node);
+        container.weights.insert(pos, 1);
         // focus the new node
         self.focus = node;
 
@@ -169,17 +274,20 @@ impl Tree {
         };
         if container.layout == layout {
             // insert node after the current item if there is children already
-            let pos = if container.children.is_empty() {
+            let insert_pos = if container.children.is_empty() {
                 0
             } else {
-                let pos = container
+                container
                     .children
                     .iter()
                     .position(|&child| child == focus)
-                    .unwrap();
-                pos + 1
+                    .unwrap()
+                    + 1
             };
-            container.children.insert(pos, node);
+            container.sync_weights();
+            container.children.insert(insert_pos, node);
+            container.weights.insert(insert_pos, 1);
+            container.weights.fill(1);
             self.nodes[node].parent = parent;
         } else {
             let mut split = Node::container(layout);
@@ -195,6 +303,7 @@ impl Tree {
             };
             container.children.push(focus);
             container.children.push(node);
+            container.weights.extend([1, 1]);
             self.nodes[focus].parent = split;
             self.nodes[node].parent = split;
 
@@ -254,7 +363,9 @@ impl Tree {
             container.children[pos] = new;
             self.nodes[new].parent = parent;
         } else {
+            container.sync_weights();
             container.children.remove(pos);
+            container.weights.remove(pos);
         }
     }
 
@@ -282,6 +393,7 @@ impl Tree {
             // Lets merge the only child back to its grandparent so that Views
             // are equally spaced.
             let sibling = parent_container.children.pop().unwrap();
+            parent_container.weights.pop();
             self.remove_or_replace(parent, Some(sibling));
         }
 
@@ -429,77 +541,171 @@ impl Tree {
         // b) node is container, calculate areas for each child and push them on the stack
 
         while let Some((key, area)) = self.stack.pop() {
-            let node = &mut self.nodes[key];
+            if let Content::View(view) = &mut self.nodes[key].content {
+                view.area = area;
+                continue;
+            }
 
-            match &mut node.content {
-                Content::View(view) => {
-                    // debug!!("setting view area {:?}", area);
-                    view.area = area;
-                } // TODO: call f()
-                Content::Container(container) => {
-                    // debug!!("setting container area {:?}", area);
-                    container.area = area;
+            let (layout, children, weights) = {
+                let container = self.container_mut(key);
+                container.area = area;
+                container.sync_weights();
+                (
+                    container.layout,
+                    container.children.clone(),
+                    container.weights.clone(),
+                )
+            };
+            let gaps = if layout == Layout::Vertical {
+                children.len().saturating_sub(1) as u16
+            } else {
+                0
+            };
+            let available = extent(area, layout).saturating_sub(gaps);
+            let minima = children
+                .iter()
+                .map(|child| self.minimum_extent(*child, layout))
+                .collect::<Vec<_>>();
+            let sizes = constrained_weighted_sizes(available, &weights, &minima);
 
-                    match container.layout {
-                        Layout::Horizontal => {
-                            let len = container.children.len();
+            let mut offset = 0u16;
+            for (child, size) in children.into_iter().zip(sizes) {
+                let child_area = match layout {
+                    Layout::Horizontal => Rect::new(area.x, area.y + offset, area.width, size),
+                    Layout::Vertical => Rect::new(area.x + offset, area.y, size, area.height),
+                };
+                offset = offset
+                    .saturating_add(size.saturating_add(u16::from(layout == Layout::Vertical)));
+                self.stack.push((child, child_area));
+            }
+        }
+    }
 
-                            let height = area.height / len as u16;
-
-                            let mut child_y = area.y;
-
-                            for (i, child) in container.children.iter().enumerate() {
-                                let mut area = Rect::new(
-                                    container.area.x,
-                                    child_y,
-                                    container.area.width,
-                                    height,
-                                );
-                                child_y += height;
-
-                                // last child takes the remaining width because we can get uneven
-                                // space from rounding
-                                if i == len - 1 {
-                                    area.height = container.area.y + container.area.height - area.y;
-                                }
-
-                                self.stack.push((*child, area));
-                            }
-                        }
-                        Layout::Vertical => {
-                            let len = container.children.len();
-                            let len_u16 = len as u16;
-
-                            let inner_gap = 1u16;
-                            let total_gap = inner_gap * len_u16.saturating_sub(2);
-
-                            let used_area = area.width.saturating_sub(total_gap);
-                            let width = used_area / len_u16;
-
-                            let mut child_x = area.x;
-
-                            for (i, child) in container.children.iter().enumerate() {
-                                let mut area = Rect::new(
-                                    child_x,
-                                    container.area.y,
-                                    width,
-                                    container.area.height,
-                                );
-                                child_x += width + inner_gap;
-
-                                // last child takes the remaining width because we can get uneven
-                                // space from rounding
-                                if i == len - 1 {
-                                    area.width = container.area.x + container.area.width - area.x;
-                                }
-
-                                self.stack.push((*child, area));
-                            }
-                        }
-                    }
+    fn minimum_extent(&self, id: ViewId, layout: Layout) -> u16 {
+        match &self.nodes[id].content {
+            Content::View(_) => match layout {
+                Layout::Vertical => 1,
+                Layout::Horizontal => 2,
+            },
+            Content::Container(container) => {
+                let child_minima = container
+                    .children
+                    .iter()
+                    .map(|child| self.minimum_extent(*child, layout));
+                if container.layout == layout {
+                    child_minima.fold(0u16, u16::saturating_add).saturating_add(
+                        if layout == Layout::Vertical {
+                            container.children.len().saturating_sub(1) as u16
+                        } else {
+                            0
+                        },
+                    )
+                } else {
+                    child_minima.max().unwrap_or(0)
                 }
             }
         }
+    }
+
+    fn resize_boundary(&self, layout: Layout) -> Option<(ViewId, usize, usize)> {
+        let mut branch = self.focus;
+        let mut fallback = None;
+        loop {
+            let parent = self.nodes[branch].parent;
+            if parent == branch {
+                return fallback;
+            }
+            let Content::Container(container) = &self.nodes[parent].content else {
+                unreachable!()
+            };
+            let position = container
+                .children
+                .iter()
+                .position(|child| *child == branch)?;
+            if container.layout == layout {
+                if position + 1 < container.children.len() {
+                    return Some((parent, position, position + 1));
+                }
+                if fallback.is_none() && position > 0 {
+                    fallback = Some((parent, position, position - 1));
+                }
+            }
+            branch = parent;
+        }
+    }
+
+    /// Grow (positive delta) or shrink (negative delta) the focused branch by
+    /// terminal cells, preferring the right/bottom boundary before left/top.
+    pub fn resize_focused(&mut self, axis: ResizeAxis, delta: i32) -> i32 {
+        if delta == 0 || self.fullscreen.is_some() || self.is_empty() {
+            return 0;
+        }
+        let layout = axis.layout();
+        let Some((parent, focus_pos, neighbor_pos)) = self.resize_boundary(layout) else {
+            return 0;
+        };
+        let (children, mut sizes) = {
+            let Content::Container(container) = &self.nodes[parent].content else {
+                unreachable!()
+            };
+            (
+                container.children.clone(),
+                container
+                    .children
+                    .iter()
+                    .map(|child| match &self.nodes[*child].content {
+                        Content::View(view) => extent(view.area, layout),
+                        Content::Container(container) => extent(container.area, layout),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let focus_minimum = self.minimum_extent(children[focus_pos], layout);
+        let neighbor_minimum = self.minimum_extent(children[neighbor_pos], layout);
+        let requested = delta.unsigned_abs().min(u32::from(u16::MAX)) as u16;
+        let available = if delta > 0 {
+            sizes[neighbor_pos].saturating_sub(neighbor_minimum)
+        } else {
+            sizes[focus_pos].saturating_sub(focus_minimum)
+        };
+        let moved = requested.min(available);
+        if moved == 0 {
+            return 0;
+        }
+        if delta > 0 {
+            sizes[focus_pos] += moved;
+            sizes[neighbor_pos] -= moved;
+        } else {
+            sizes[focus_pos] -= moved;
+            sizes[neighbor_pos] += moved;
+        }
+        self.container_mut(parent).weights = sizes.into_iter().map(u32::from).collect();
+        self.recalculate();
+        if delta > 0 {
+            i32::from(moved)
+        } else {
+            -i32::from(moved)
+        }
+    }
+
+    /// Restore equal proportions for the focused view's immediate split group.
+    pub fn equalize_focused(&mut self) -> bool {
+        if self.fullscreen.is_some() || self.is_empty() {
+            return false;
+        }
+        let parent = self.nodes[self.focus].parent;
+        let container = self.container_mut(parent);
+        if container.children.len() < 2
+            || container
+                .weights
+                .first()
+                .is_some_and(|first| container.weights.iter().all(|weight| weight == first))
+        {
+            return false;
+        }
+        container.weights.fill(1);
+        self.recalculate();
+        true
     }
 
     pub fn traverse(&self) -> Traverse<'_> {
@@ -1032,5 +1238,144 @@ mod test {
                 .map(|(view, _)| view.area.width)
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn two_view_tree(layout: Layout, width: u16, height: u16) -> (Tree, ViewId, ViewId) {
+        let mut tree = Tree::new(Rect::new(0, 0, width, height));
+        let first = tree.insert(View::new(DocumentId::default(), GutterConfig::default()));
+        let second = tree.split(
+            View::new(DocumentId::default(), GutterConfig::default()),
+            layout,
+        );
+        (tree, first, second)
+    }
+
+    #[test]
+    fn resize_focused_moves_exact_cells_and_uses_fallback_boundary() {
+        let (mut tree, left, right) = two_view_tree(Layout::Vertical, 101, 24);
+        tree.focus = left;
+        assert_eq!(tree.resize_focused(ResizeAxis::Width, 1), 1);
+        assert_eq!(tree.get(left).area.width, 51);
+        assert_eq!(tree.get(right).area.width, 49);
+
+        tree.focus = right;
+        assert_eq!(tree.resize_focused(ResizeAxis::Width, 1), 1);
+        assert_eq!(tree.get(left).area.width, 50);
+        assert_eq!(tree.get(right).area.width, 50);
+        assert_eq!(tree.resize_focused(ResizeAxis::Width, -2), -2);
+        assert_eq!(tree.get(left).area.width, 52);
+        assert_eq!(tree.get(right).area.width, 48);
+    }
+
+    #[test]
+    fn resize_focused_clamps_to_renderable_view_size() {
+        let (mut vertical, left, right) = two_view_tree(Layout::Vertical, 10, 10);
+        vertical.focus = left;
+        assert_eq!(vertical.resize_focused(ResizeAxis::Width, 100), 4);
+        assert_eq!(vertical.get(left).area.width, 8);
+        assert_eq!(vertical.get(right).area.width, 1);
+        assert_eq!(vertical.resize_focused(ResizeAxis::Width, 1), 0);
+
+        let (mut horizontal, top, bottom) = two_view_tree(Layout::Horizontal, 20, 10);
+        horizontal.focus = top;
+        assert_eq!(horizontal.resize_focused(ResizeAxis::Height, 100), 3);
+        assert_eq!(horizontal.get(top).area.height, 8);
+        assert_eq!(horizontal.get(bottom).area.height, 2);
+    }
+
+    #[test]
+    fn resize_focused_resizes_nested_branch_and_preserves_ratio() {
+        let (mut tree, left_top, right) = two_view_tree(Layout::Vertical, 101, 40);
+        tree.focus = left_top;
+        let left_bottom = tree.split(
+            View::new(DocumentId::default(), GutterConfig::default()),
+            Layout::Horizontal,
+        );
+
+        assert_eq!(tree.resize_focused(ResizeAxis::Width, 20), 20);
+        assert_eq!(tree.get(left_top).area.width, 70);
+        assert_eq!(tree.get(left_bottom).area.width, 70);
+        assert_eq!(tree.get(right).area.width, 30);
+
+        tree.resize(Rect::new(0, 0, 201, 40));
+        assert_eq!(tree.get(left_top).area.width, 140);
+        assert_eq!(tree.get(left_bottom).area.width, 140);
+        assert_eq!(tree.get(right).area.width, 60);
+
+        assert_eq!(tree.resize_focused(ResizeAxis::Height, 4), 4);
+        assert_eq!(tree.get(left_top).area.height, 16);
+        assert_eq!(tree.get(left_bottom).area.height, 24);
+        assert!(tree.equalize_focused());
+        assert_eq!(tree.get(left_top).area.height, 20);
+        assert_eq!(tree.get(left_bottom).area.height, 20);
+        assert!(!tree.equalize_focused());
+    }
+
+    #[test]
+    fn resize_is_inert_without_a_boundary_or_while_fullscreen() {
+        let mut tree = Tree::new(Rect::new(0, 0, 100, 30));
+        let only = tree.insert(View::new(DocumentId::default(), GutterConfig::default()));
+        assert_eq!(tree.resize_focused(ResizeAxis::Width, 1), 0);
+        assert!(!tree.equalize_focused());
+
+        let sibling = tree.split(
+            View::new(DocumentId::default(), GutterConfig::default()),
+            Layout::Vertical,
+        );
+        let before = tree.get(only).area;
+        tree.enter_fullscreen(sibling);
+        assert_eq!(tree.resize_focused(ResizeAxis::Width, 1), 0);
+        assert!(!tree.equalize_focused());
+        tree.leave_fullscreen();
+        assert_eq!(tree.get(only).area, before);
+    }
+
+    #[test]
+    fn splitting_an_empty_tree_installs_the_first_view() {
+        let mut tree = Tree::new(Rect::new(0, 0, 80, 24));
+        let first = tree.split(
+            View::new(DocumentId::default(), GutterConfig::default()),
+            Layout::Vertical,
+        );
+        assert_eq!(tree.focus, first);
+        assert_eq!(tree.get(first).area, Rect::new(0, 0, 80, 24));
+        assert_eq!(tree.active_views().count(), 1);
+    }
+
+    #[test]
+    fn custom_boundaries_survive_close_swap_and_transpose() {
+        let (mut swapped, left, right) = two_view_tree(Layout::Vertical, 101, 100);
+        swapped.focus = left;
+        assert_eq!(swapped.resize_focused(ResizeAxis::Width, 10), 10);
+        swapped.swap_split_in_direction(Direction::Right).unwrap();
+        assert_eq!(
+            swapped
+                .active_views()
+                .map(|(view, _)| view.area.width)
+                .collect::<Vec<_>>(),
+            vec![60, 40]
+        );
+        assert_eq!(swapped.get(right).area.width, 60);
+        assert_eq!(swapped.get(left).area.width, 40);
+
+        swapped.transpose();
+        assert_eq!(
+            swapped
+                .active_views()
+                .map(|(view, _)| view.area.height)
+                .collect::<Vec<_>>(),
+            vec![60, 40]
+        );
+
+        let (mut closed, first, second) = two_view_tree(Layout::Vertical, 101, 24);
+        let third = closed.split(
+            View::new(DocumentId::default(), GutterConfig::default()),
+            Layout::Vertical,
+        );
+        closed.focus = first;
+        assert_eq!(closed.resize_focused(ResizeAxis::Width, 10), 10);
+        closed.remove(third);
+        assert_eq!(closed.get(first).area.width, 65);
+        assert_eq!(closed.get(second).area.width, 35);
     }
 }

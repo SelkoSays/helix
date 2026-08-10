@@ -54,6 +54,7 @@ impl Tree {
         self.nodes[view_id].parent = root;
         if let Content::Container(container) = &mut self.nodes[root].content {
             container.children.push(view_id);
+            container.weights.push(1);
         }
         self.focus = view_id;
         self.recalculate();
@@ -134,6 +135,7 @@ impl Tree {
         let parent_container = self.container_mut(parent);
         if parent_container.children.len() == 1 && !parent_is_root {
             let sibling = parent_container.children.pop().unwrap();
+            parent_container.weights.pop();
             self.remove_or_replace(parent, Some(sibling));
         }
 
@@ -200,5 +202,25 @@ mod tests {
         assert!(tree.node_is_active(left));
         assert!(!tree.contains(right));
         assert_eq!(tree.active_views().count(), 1);
+    }
+
+    #[test]
+    fn temporary_layout_restores_custom_split_proportions() {
+        let mut tree = Tree::new(Rect::new(0, 0, 101, 30));
+        let left = tree.insert(View::new(DocumentId::default(), Vec::new().into()));
+        let right = tree.split(
+            View::new(DocumentId::default(), Vec::new().into()),
+            super::super::Layout::Vertical,
+        );
+        tree.focus = left;
+        assert_eq!(tree.resize_focused(super::super::ResizeAxis::Width, 20), 20);
+        let left_area = tree.get(left).area;
+        let right_area = tree.get(right).area;
+
+        let (token, _) =
+            tree.enter_temporary_layout(View::new(DocumentId::default(), Vec::new().into()));
+        tree.restore_temporary_layout(token).unwrap();
+        assert_eq!(tree.get(left).area, left_area);
+        assert_eq!(tree.get(right).area, right_area);
     }
 }
