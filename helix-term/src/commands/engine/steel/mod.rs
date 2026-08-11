@@ -42,7 +42,7 @@ use helix_view::{
         SelectionDidChange,
     },
     extension::{document_id_to_usize, steel_implementations::CustomStatusElement},
-    graphics::CursorKind,
+    graphics::{CursorKind, Rect},
     input::KeyEvent,
     theme::Color,
     DocumentId, Editor, Theme, ViewId,
@@ -1432,6 +1432,7 @@ fn load_editor_api(engine: &mut Engine, generate_sources: bool) {
         })
         .register_fn_with_ctx(CTX, "themes->list", get_themes)
         .register_fn_with_ctx(CTX, "editor-all-documents", cx_editor_all_documents)
+        .register_fn_with_ctx(CTX, "editor-bufferline-area", cx_editor_bufferline_area)
         .register_fn_with_ctx(CTX, "cx->cursor", |cx: &mut Context| cx.editor.cursor())
         .register_fn_with_ctx(CTX, "current-cursor", |cx: &mut Context| cx.editor.cursor())
         .register_fn_with_ctx(CTX, "editor-focused-buffer-area", current_buffer_area)
@@ -1530,6 +1531,7 @@ fn load_editor_api(engine: &mut Engine, generate_sources: bool) {
         )
         .register_fn_with_ctx(CTX, "editor->text", document_id_to_text)
         .register_fn_with_ctx(CTX, "editor-document->path", document_path)
+        .register_fn_with_ctx(CTX, "editor-document->display-name", document_display_name)
         .register_fn_with_ctx(CTX, "register->value", cx_register_value)
         .register_fn_with_ctx(
             CTX,
@@ -4919,6 +4921,17 @@ fn document_path(cx: &mut Context, doc_id: DocumentId) -> Option<String> {
         .and_then(|doc| doc.path().and_then(|x| x.to_str()).map(|x| x.to_string()))
 }
 
+fn document_display_name(cx: &mut Context, doc_id: DocumentId) -> Option<String> {
+    cx.editor
+        .documents
+        .get(&doc_id)
+        .map(|doc| doc.display_name().into_owned())
+}
+
+fn cx_editor_bufferline_area(cx: &mut Context, area: Rect) -> Option<Rect> {
+    ui::EditorView::bufferline_area(cx.editor, area)
+}
+
 fn cx_editor_all_documents(cx: &mut Context) -> Vec<DocumentId> {
     cx.editor.documents.keys().copied().collect()
 }
@@ -4962,14 +4975,7 @@ fn push_component(cx: &mut Context, component: &mut WrappedDynComponent) {
     log::info!("Pushing dynamic component!");
 
     let inner = component.inner.take().unwrap();
-
-    let callback = async move {
-        let call: Box<LocalJobCallback> = Box::new(
-            move |_editor: &mut Editor, compositor: &mut Compositor, _| compositor.push(inner),
-        );
-        Ok(call)
-    };
-    cx.jobs.local_callback(callback);
+    cx.push_layer(inner);
 }
 
 fn pop_last_component_by_name(cx: &mut Context, name: SteelString) {

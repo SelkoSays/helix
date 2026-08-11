@@ -24,14 +24,14 @@ use helix_core::{
 };
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
-    document::{Mode, SCRATCH_BUFFER_NAME},
+    document::Mode,
     editor::{CompleteAction, CursorShapeConfig},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
     Document, DocumentId, Editor, Theme, View, ViewId,
 };
-use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
+use std::{mem::take, num::NonZeroUsize, ops, rc::Rc};
 
 use tui::{buffer::Buffer as Surface, text::Span};
 
@@ -689,7 +689,6 @@ impl EditorView {
 
     /// Render bufferline at the top
     pub fn render_bufferline(editor: &Editor, viewport: Rect, surface: &mut Surface) {
-        let scratch = PathBuf::from(SCRATCH_BUFFER_NAME); // default filename to use for scratch buffer
         surface.clear_with(
             viewport,
             editor
@@ -712,13 +711,15 @@ impl EditorView {
         let current_doc = view!(editor).doc;
 
         for doc in editor.documents() {
-            let fname = doc
-                .path()
-                .unwrap_or(&scratch)
-                .file_name()
-                .unwrap_or_default()
-                .to_str()
-                .unwrap_or_default();
+            let name = doc.path().map_or_else(
+                || format!("◇ {}", doc.display_name()),
+                |path| {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                },
+            );
 
             let style = if current_doc == doc.id() {
                 bufferline_active
@@ -726,7 +727,7 @@ impl EditorView {
                 bufferline_inactive
             };
 
-            let text = format!(" {}{} ", fname, if doc.is_modified() { "[+]" } else { "" });
+            let text = format!(" {}{} ", name, if doc.is_modified() { "[+]" } else { "" });
             let used_width = viewport.x.saturating_sub(x);
             let rem_width = surface.area.width.saturating_sub(used_width);
 
@@ -738,6 +739,38 @@ impl EditorView {
                 break;
             }
         }
+    }
+
+    fn clipped_area(editor: &Editor, mut area: Rect) -> Rect {
+        if let Some(top) = editor.editor_clipping.top {
+            area = area.clip_top(top);
+        }
+        if let Some(bottom) = editor.editor_clipping.bottom {
+            area = area.clip_bottom(bottom);
+        }
+        if let Some(left) = editor.editor_clipping.left {
+            area = area.clip_left(left);
+        }
+        if let Some(right) = editor.editor_clipping.right {
+            area = area.clip_right(right);
+        }
+        area
+    }
+
+    fn uses_bufferline(editor: &Editor) -> bool {
+        use helix_view::editor::BufferLine;
+
+        match editor.config().bufferline {
+            BufferLine::Always => true,
+            BufferLine::Multiple => editor.documents.len() > 1,
+            BufferLine::Never => false,
+        }
+    }
+
+    /// Return the exact row occupied by the bufferline for an outer component
+    /// area, or `None` when the configured bufferline is not visible.
+    pub(crate) fn bufferline_area(editor: &Editor, area: Rect) -> Option<Rect> {
+        Self::uses_bufferline(editor).then(|| Self::clipped_area(editor, area).with_height(1))
     }
 
     pub fn render_gutter<'d>(
@@ -1653,34 +1686,12 @@ impl Component for EditorView {
         // clear with background color
         surface.set_style(area, cx.editor.theme.get("ui.background"));
         let config = cx.editor.config();
-
-        // check if bufferline should be rendered
-        use helix_view::editor::BufferLine;
-        let use_bufferline = match config.bufferline {
-            BufferLine::Always => true,
-            BufferLine::Multiple if cx.editor.documents.len() > 1 => true,
-            _ => false,
-        };
-
-        let mut area = area;
-
-        // TODO: This may need to get looked at!
-        if let Some(top) = cx.editor.editor_clipping.top {
-            area = area.clip_top(top);
-        }
-        if let Some(bottom) = cx.editor.editor_clipping.bottom {
-            area = area.clip_bottom(bottom);
-        }
-        if let Some(left) = cx.editor.editor_clipping.left {
-            area = area.clip_left(left);
-        }
-        if let Some(right) = cx.editor.editor_clipping.right {
-            area = area.clip_right(right);
-        }
+        let bufferline_area = Self::bufferline_area(cx.editor, area);
+        let area = Self::clipped_area(cx.editor, area);
 
         // -1 for commandline and -1 for bufferline
         let mut editor_area = area.clip_bottom(1);
-        if use_bufferline {
+        if bufferline_area.is_some() {
             editor_area = editor_area.clip_top(1);
         }
 
@@ -1688,8 +1699,8 @@ impl Component for EditorView {
         cx.editor.resize(editor_area);
         cx.editor.synchronize_linked_scroll();
 
-        if use_bufferline {
-            Self::render_bufferline(cx.editor, area.with_height(1), surface);
+        if let Some(bufferline_area) = bufferline_area {
+            Self::render_bufferline(cx.editor, bufferline_area, surface);
         }
 
         let views: Vec<(ViewId, bool)> = {

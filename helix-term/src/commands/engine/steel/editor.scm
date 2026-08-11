@@ -203,6 +203,12 @@
 ;;
 (define editor-all-documents helix.editor-all-documents)
 
+(provide editor-bufferline-area)
+;;@doc
+;;Return the exact row occupied by the native bufferline inside an outer
+;;component area, or `#false` when the bufferline is currently hidden.
+(define editor-bufferline-area helix.editor-bufferline-area)
+
 (provide cx->cursor)
 ;;@doc
 ;;DEPRECATED: Please use `current-cursor`
@@ -333,6 +339,11 @@
 ;;@doc
 ;;Get the path to a document.
 (define editor-document->path helix.editor-document->path)
+
+(provide editor-document->display-name)
+;;@doc
+;;Get the editor display name for a file-backed or named scratch document.
+(define editor-document->display-name helix.editor-document->display-name)
 
 (provide register->value)
 ;;@doc
