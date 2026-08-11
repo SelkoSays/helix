@@ -9,6 +9,8 @@ use steel::steel_vm::builtin::BuiltInModule;
 
 // Declared here rather than in the Steel `mod.rs` so the whole extension
 // surface stays behind this one registrar.
+#[path = "binary.rs"]
+mod binary;
 #[path = "diagnostic_snapshot.rs"]
 mod diagnostic_snapshot;
 #[path = "json.rs"]
@@ -248,6 +250,19 @@ fn register_json(engine: &mut Engine, generate_sources: bool) {
     engine.register_module(module);
 }
 
+fn register_binary(engine: &mut Engine, generate_sources: bool) {
+    let mut module = BuiltInModule::new("helix/core/binary");
+    binary::register(&mut module);
+
+    let source = include_str!("binary.scm");
+    if generate_sources {
+        generate_module("binary.scm", source);
+        configure_lsp_builtins("binary", &module);
+    }
+    engine.register_steel_module("helix/binary.scm".to_string(), source.to_string());
+    engine.register_module(module);
+}
+
 fn register_markdown_preview(engine: &mut Engine, generate_sources: bool) {
     let mut module = BuiltInModule::new("helix/core/markdown-preview");
     markdown_preview::register(&mut module);
@@ -269,6 +284,7 @@ pub(super) fn register_builtin(engine: &mut Engine, generate_sources: bool) {
     register_syntax_highlight(engine, generate_sources);
     register_regex(engine, generate_sources);
     register_json(engine, generate_sources);
+    register_binary(engine, generate_sources);
     register_markdown_preview(engine, generate_sources);
 }
 
