@@ -459,6 +459,7 @@ impl MappableCommand {
         extend_to_file_start, "Extend to line number `<n>` else file start",
         extend_to_file_end, "Extend to file end",
         goto_file, "Goto files/URLs in selections",
+        goto_file_location, "Goto file under the primary cursor at an optional line and column",
         goto_file_hsplit, "Goto files in selections (hsplit)",
         goto_file_vsplit, "Goto files in selections (vsplit)",
         goto_reference, "Goto references",
@@ -1350,15 +1351,251 @@ fn goto_file_end_impl(cx: &mut Context, movement: Movement) {
 }
 
 fn goto_file(cx: &mut Context) {
-    goto_file_impl(cx, Action::Replace);
+    goto_file_impl(cx, Action::Replace, false);
+}
+
+fn goto_file_location(cx: &mut Context) {
+    goto_file_impl(cx, Action::Replace, true);
 }
 
 fn goto_file_hsplit(cx: &mut Context) {
-    goto_file_impl(cx, Action::HorizontalSplit);
+    goto_file_impl(cx, Action::HorizontalSplit, false);
 }
 
 fn goto_file_vsplit(cx: &mut Context) {
-    goto_file_impl(cx, Action::VerticalSplit);
+    goto_file_impl(cx, Action::VerticalSplit, false);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileReference {
+    path: String,
+    position: Option<Position>,
+}
+
+impl FileReference {
+    fn plain(path: String) -> Self {
+        Self {
+            path,
+            position: None,
+        }
+    }
+}
+
+fn parse_file_reference(value: String, rel_path: &Path) -> FileReference {
+    if Url::parse(&value).is_ok() || reference_path_exists(&value, rel_path) {
+        return FileReference::plain(value);
+    }
+
+    let Some((path, position)) = parse_file_reference_position(&value) else {
+        return FileReference::plain(value);
+    };
+
+    FileReference {
+        path: path.to_owned(),
+        position: Some(position),
+    }
+}
+
+fn parse_file_reference_position(value: &str) -> Option<(&str, Position)> {
+    let (prefix, last) = value.rsplit_once(':')?;
+    if prefix.is_empty() || last.is_empty() {
+        return None;
+    }
+
+    let last: usize = last.parse().ok()?;
+    if let Some((path, row)) = prefix.rsplit_once(':') {
+        if !path.is_empty() {
+            if let Ok(row) = row.parse::<usize>() {
+                return Some((
+                    path,
+                    Position::new(row.saturating_sub(1), last.saturating_sub(1)),
+                ));
+            }
+        }
+    }
+
+    Some((prefix, Position::new(last.saturating_sub(1), 0)))
+}
+
+fn reference_path_exists(value: &str, rel_path: &Path) -> bool {
+    rel_path.join(path::expand(value).as_ref()).exists()
+}
+
+fn file_reference_position(text: RopeSlice<'_>, position: Position) -> usize {
+    let position = pos_at_coords(text, position, true);
+    let line = text.char_to_line(position);
+    let line_start = text.line_to_char(line);
+    let line_end = line_end_char_index(&text, line);
+
+    if position == line_end && line_end > line_start {
+        graphemes::prev_grapheme_boundary(text, line_end)
+    } else {
+        position
+    }
+}
+
+fn path_continuation(character: char) -> bool {
+    character.is_alphanumeric()
+        || matches!(
+            character,
+            '_' | '.'
+                | '-'
+                | '+'
+                | '@'
+                | '#'
+                | '$'
+                | '%'
+                | '?'
+                | '!'
+                | '~'
+                | '&'
+                | '='
+                | '/'
+                | '\\'
+                | ':'
+        )
+}
+
+/// Return the byte length and position encoded by a suffix beginning with `:`.
+fn parse_file_reference_suffix(value: &str) -> Option<(usize, Position)> {
+    let bytes = value.as_bytes();
+    if bytes.first() != Some(&b':') {
+        return None;
+    }
+
+    let mut end = 1;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    if end == 1 {
+        return None;
+    }
+
+    let row: usize = value[1..end].parse().ok()?;
+    let mut column: usize = 1;
+    if bytes.get(end) == Some(&b':') {
+        let column_start = end + 1;
+        end = column_start;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if end == column_start {
+            return None;
+        }
+        column = value[column_start..end].parse().ok()?;
+    }
+
+    if value[end..].chars().next().is_some_and(path_continuation) {
+        return None;
+    }
+
+    Some((
+        end,
+        Position::new(row.saturating_sub(1), column.saturating_sub(1)),
+    ))
+}
+
+fn extend_file_reference(
+    search_range: RopeSlice<'_>,
+    range: std::ops::Range<usize>,
+    search_start: usize,
+    rel_path: &Path,
+) -> (std::ops::Range<usize>, FileReference) {
+    let path_value = search_range.byte_slice(range.clone()).to_string();
+    let suffix = search_range.byte_slice(range.end..).to_string();
+    let Some((suffix_len, position)) = parse_file_reference_suffix(&suffix) else {
+        return (range, FileReference::plain(path_value));
+    };
+
+    let extended_end = range.end + suffix_len;
+    let value = search_range
+        .byte_slice(range.start..extended_end)
+        .to_string();
+    if reference_path_exists(&value, rel_path) {
+        return (range.start..extended_end, FileReference::plain(value));
+    }
+
+    log::debug!(
+        "goto_file_location auto-detected position at byte {}: {:?}",
+        search_start + extended_end,
+        position
+    );
+    (
+        range.start..extended_end,
+        FileReference {
+            path: path_value,
+            position: Some(position),
+        },
+    )
+}
+
+#[cfg(test)]
+mod file_reference_tests {
+    use super::*;
+
+    #[test]
+    fn parses_one_based_file_positions() {
+        assert_eq!(
+            parse_file_reference_position("example.txt:20"),
+            Some(("example.txt", Position::new(19, 0)))
+        );
+        assert_eq!(
+            parse_file_reference_position("example.txt:20:5"),
+            Some(("example.txt", Position::new(19, 4)))
+        );
+        assert_eq!(
+            parse_file_reference_position("example.txt:0:0"),
+            Some(("example.txt", Position::new(0, 0)))
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_non_numeric_file_positions() {
+        for value in [
+            "example.txt:",
+            "example.txt:abc",
+            "example.txt:20:x",
+            "example.txt:20:",
+        ] {
+            assert_eq!(parse_file_reference_position(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn suffix_parser_requires_a_complete_reference_boundary() {
+        assert_eq!(
+            parse_file_reference_suffix(":20:5)"),
+            Some((5, Position::new(19, 4)))
+        );
+        assert_eq!(
+            parse_file_reference_suffix(":20 "),
+            Some((3, Position::new(19, 0)))
+        );
+        assert_eq!(parse_file_reference_suffix(":20:x"), None);
+        assert_eq!(parse_file_reference_suffix(":20.txt"), None);
+    }
+
+    #[test]
+    fn exact_existing_paths_win_over_location_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("example.txt:20:5");
+        std::fs::write(&file, "content").unwrap();
+
+        assert_eq!(
+            parse_file_reference("example.txt:20:5".to_owned(), directory.path()),
+            FileReference::plain("example.txt:20:5".to_owned())
+        );
+    }
+
+    #[test]
+    fn file_positions_clamp_to_the_last_grapheme() {
+        let text = Rope::from("abc\n\n");
+        let text = text.slice(..);
+
+        assert_eq!(file_reference_position(text, Position::new(0, 1)), 1);
+        assert_eq!(file_reference_position(text, Position::new(0, 50)), 2);
+        assert_eq!(file_reference_position(text, Position::new(50, 50)), 4);
+    }
 }
 
 /// Returns true when a selection overlaps an LSP document link range.
@@ -1403,10 +1640,14 @@ fn resolve_document_link_request(
 ///
 /// Prefers LSP document links when the cursor/selection overlaps a link range,
 /// falling back to the built-in path/URL detection otherwise.
-fn goto_file_impl(cx: &mut Context, action: Action) {
+fn goto_file_impl(cx: &mut Context, action: Action, location_aware: bool) {
     let (view, doc) = current_ref!(cx.editor);
     let text = doc.text().clone();
-    let selections = doc.selection(view.id).ranges().to_vec();
+    let selections = if location_aware {
+        vec![doc.selection(view.id).primary()]
+    } else {
+        doc.selection(view.id).ranges().to_vec()
+    };
     let rel_path = doc
         .relative_path()
         .map(|path| path.parent().unwrap().to_path_buf())
@@ -1484,7 +1725,7 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
         return;
     }
 
-    let paths: Vec<_> = if fallback_ranges.len() == 1 && fallback_ranges[0].len() == 1 {
+    let paths: Vec<FileReference> = if fallback_ranges.len() == 1 && fallback_ranges[0].len() == 1 {
         let selection = fallback_ranges[0];
         // Cap the search at roughly 1k bytes around the cursor.
         let lookaround = 1000;
@@ -1501,33 +1742,68 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
         // but apparently that is how gf has worked historically in helix)
         let path = find_paths(search_range, true)
             .take_while(|range| search_start + range.start <= pos + 1)
-            .find(|range| pos <= search_start + range.end)
-            .map(|range| Cow::from(search_range.byte_slice(range)));
+            .filter_map(|range| {
+                let (range, reference) = if location_aware {
+                    extend_file_reference(search_range, range, search_start, &rel_path)
+                } else {
+                    let value = search_range.byte_slice(range.clone()).to_string();
+                    (range, FileReference::plain(value))
+                };
+                (pos <= search_start + range.end).then_some(reference)
+            })
+            .next();
         log::debug!("goto_file auto-detected path: {path:?}");
-        let path = path.unwrap_or_else(|| selection.fragment(text));
-        vec![path.into_owned()]
+        let path = path.unwrap_or_else(|| {
+            let value = selection.fragment(text).into_owned();
+            if location_aware {
+                parse_file_reference(value, &rel_path)
+            } else {
+                FileReference::plain(value)
+            }
+        });
+        vec![path]
     } else {
         // Otherwise use each selection, trimmed.
         fallback_ranges
             .iter()
             .map(|range| range.fragment(text).trim().to_owned())
-            .filter(|sel| !sel.is_empty())
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                if location_aware {
+                    parse_file_reference(value, &rel_path)
+                } else {
+                    FileReference::plain(value)
+                }
+            })
             .collect()
     };
 
-    for sel in paths {
-        if let Ok(url) = Url::parse(&sel) {
+    for reference in paths {
+        if let Ok(url) = Url::parse(&reference.path) {
             open_url(cx, url, action);
             continue;
         }
 
-        let path = path::expand(&sel);
+        let path = path::expand(&reference.path);
         let path = &rel_path.join(path);
         if path.is_dir() {
             let picker = ui::file_picker(cx.editor, path.into());
             cx.push_layer(Box::new(overlaid(picker)));
-        } else if let Err(e) = cx.editor.open(path, action) {
-            cx.editor.set_error(format!("Open file failed: {:?}", e));
+        } else {
+            match cx.editor.open(path, action) {
+                Ok(_) => {
+                    if let Some(position) = reference.position {
+                        let scrolloff = cx.editor.config().scrolloff;
+                        let (view, doc) = current!(cx.editor);
+                        let position = file_reference_position(doc.text().slice(..), position);
+                        doc.set_selection(view.id, Selection::point(position));
+                        view.ensure_cursor_in_view(doc, scrolloff);
+                    }
+                }
+                Err(error) => cx
+                    .editor
+                    .set_error(format!("Open file failed: {:?}", error)),
+            }
         }
     }
 }
