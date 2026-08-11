@@ -4,6 +4,11 @@ Register commands whose modules and initializers run on first invocation.
 ### **register-async-lazy-plugin!**
 Register lazy commands and queue compilation after init.scm completes.
 Evaluation and initialization still happen on first invocation.
+### **discover-lazy-commands**
+Read annotated command names and documentation from Scheme source without
+compiling or evaluating the source.
+### **register-discovered-lazy-plugin!**
+Register commands discovered from annotated Scheme source for lazy activation.
 # /home/le-mrak/.local/share/steel/cogs/helix/treesitter.scm
 ### **TSTree?**
 Check if the given value is a treesitter tree
@@ -625,6 +630,8 @@ Extend to line number `<n>` else file start
 Extend to file end
 ### **goto_file**
 Goto files/URLs in selections
+### **goto_file_location**
+Goto file under the primary cursor at an optional line and column
 ### **goto_file_hsplit**
 Goto files in selections (hsplit)
 ### **goto_file_vsplit**
@@ -2148,6 +2155,14 @@ Check whether the given event is the key: keypad-begin
 (key-event-keypad-begin? event)
 ```
 event: Event?
+# /home/le-mrak/.local/share/steel/cogs/helix/json.scm
+### **json-parse**
+Parse one JSON value into ordinary Steel values. The optional byte limit
+defaults to eight MiB and is checked before parsing.
+### **json-parse-lines**
+Parse newline-delimited JSON into a list. Blank lines are ignored. Errors
+name the one-based input line. Limits default to eight MiB and 100000 items.
+# /home/le-mrak/.local/share/steel/cogs/helix/diagnostics.scm
 # /home/le-mrak/.local/share/steel/cogs/helix/configuration.scm
 ### **statusline**
 Configuration of the statusline elements.
@@ -2671,6 +2686,26 @@ Inline diagnostics max diagnostics
 Get the configuration for a specific language
 ### **set-language-config!**
 Set the language configuration
+# /home/le-mrak/.local/share/steel/cogs/helix/binary.scm
+### **binary-file-open**
+Open one existing local regular file as an opaque, read-only binary handle.
+### **binary-file-close!**
+Close a binary handle. Repeated closure returns false.
+### **binary-file-path**
+Return the canonical UTF-8 path retained by a binary handle.
+### **binary-file-size**
+Return the byte size captured when a binary handle was opened.
+### **binary-file-stale?**
+Return true when the handle is closed or the file changed on disk.
+### **binary-file-read**
+Read at most one MiB from an exact byte offset into a bytevector.
+### **binary-search-token**
+Create a cancellation token for one asynchronous binary search.
+### **binary-search-cancel!**
+Cancel a binary search token. Repeated cancellation returns false.
+### **binary-file-search**
+Search a half-open byte range asynchronously and call back with a structured
+status/offset pair. Direction is `forward` or `reverse`.
 # /home/le-mrak/.local/share/steel/cogs/helix/ext.scm
 ### **eval-buffer**
 Eval the current buffer, morally equivalent to load-buffer!
@@ -2946,6 +2981,9 @@ Every non-overlapping match as a list of `(start end)` character ranges.
 ### **regex-replace-all**
 Replace every match, expanding `$1` and `${name}` capture references in the
 replacement.
+### **regex-expand-match**
+Expand the replacement for the exact `(start end)` character range in
+`text`, or return #false when that range is not the next regex match.
 # /home/le-mrak/.local/share/steel/cogs/helix/editor.scm
 ### **register-hook**
 Register a hook to be called after the event kind fired. It is not possible
@@ -3096,6 +3134,9 @@ Get a list of all of the document ids that are currently open.
 (editor-all-documents) -> (listof DocumentId?)
 ```
 
+### **editor-bufferline-area**
+Return the exact row occupied by the native bufferline inside an outer
+component area, or `#false` when the bufferline is currently hidden.
 ### **cx->cursor**
 DEPRECATED: Please use `current-cursor`
 ### **current-cursor**
@@ -3155,6 +3196,8 @@ Reload a document.
 Get the document as a rope.
 ### **editor-document->path**
 Get the path to a document.
+### **editor-document->display-name**
+Get the editor display name for a file-backed or named scratch document.
 ### **register->value**
 Get register value as a list of strings.
 ### **set-editor-clip-top!**
@@ -3766,6 +3809,22 @@ Suspend the current split layout, display the requested DocumentId, and
 return an opaque restoration token.
 ### **temporary-layout-restore!**
 Restore the most recently suspended layout identified by token.
+### **view-resize!**
+Grow or shrink the focused split branch along width or height by a signed
+terminal-cell delta. Return the signed number of cells actually moved.
+### **view-equalize!**
+Restore equal proportions in the focused view's immediate split group.
+# /home/le-mrak/.local/share/steel/cogs/helix/markdown-preview.scm
+### **markdown-structure**
+Parse non-rendering Markdown structure. Source ranges are zero-based,
+half-open character offsets. `source-path` is a string or `#false` and is
+used only to resolve local destinations; no target is opened.
+### **markdown-render**
+Render Markdown into an opaque native result. `source-path` is a string or
+`#false`; relative targets remain unresolved when it is false. Width is in
+terminal cells. `show-links?` keeps image destinations in the output.
+### **markdown-render-text**
+Return the plain preview-buffer text held by a render.
 # helix/core/text
 To use, you can include with `(require-builtin helix/core/text)`
 ### **Rope?**
