@@ -5,7 +5,9 @@ use helix_core::graphemes::Grapheme;
 use helix_core::str_utils::char_to_byte_idx;
 use helix_core::syntax::{self, HighlightEvent, Highlighter, OverlayHighlights};
 use helix_core::text_annotations::TextAnnotations;
-use helix_core::{visual_offset_from_block, Position, RopeSlice};
+use helix_core::{
+    unicode::segmentation::UnicodeSegmentation, visual_offset_from_block, Position, RopeSlice,
+};
 use helix_stdx::rope::RopeSliceExt;
 use helix_view::editor::{WhitespaceConfig, WhitespaceRenderValue};
 use helix_view::graphics::Rect;
@@ -85,6 +87,11 @@ pub fn render_text(
     let mut syntax_highlighter =
         SyntaxHighlighter::new(syntax_highlighter, text, theme, renderer.text_style);
     let mut overlay_highlighter = OverlayHighlighter::new_at(overlay_highlights, theme, anchor);
+    let (background_highlights, concrete_highlights): (Vec<_>, Vec<_>) = concrete_highlights
+        .into_iter()
+        .partition(|range| range.behind_overlays);
+    let mut background_highlighter =
+        ConcreteStyleHighlighter::new_at(background_highlights, anchor);
     let mut concrete_highlighter = ConcreteStyleHighlighter::new_at(concrete_highlights, anchor);
 
     let mut last_line_pos = LinePos {
@@ -102,7 +109,10 @@ pub fn render_text(
             break;
         };
 
-        // skip any graphemes on visual lines before the block start
+        // Skip formatter checkpoint rows before the block containing the
+        // anchor, but keep traversing rows hidden by the view's vertical
+        // offset. Decorations need those hidden document rows to render a
+        // virtual-line block when the viewport begins in the middle of it.
         if grapheme.visual_pos.row < row_off {
             continue;
         }
@@ -137,6 +147,14 @@ pub fn render_text(
             decorations.decorate_line(renderer, last_line_pos);
         }
 
+        // Hidden real text is not drawn, but decorations still consume it and
+        // line transitions above still render any visible tail of a virtual
+        // block anchored to the preceding document row.
+        if grapheme.visual_pos.row < renderer.offset.row {
+            decorations.decorate_grapheme(renderer, &grapheme);
+            continue;
+        }
+
         // acquire the correct grapheme style
         while grapheme.char_idx >= syntax_highlighter.pos {
             syntax_highlighter.advance();
@@ -144,6 +162,7 @@ pub fn render_text(
         while grapheme.char_idx >= overlay_highlighter.pos {
             overlay_highlighter.advance();
         }
+        background_highlighter.advance_to(grapheme.char_idx);
         concrete_highlighter.advance_to(grapheme.char_idx);
 
         let grapheme_style = if let GraphemeSource::VirtualText { highlight } = grapheme.source {
@@ -157,7 +176,7 @@ pub fn render_text(
             }
         } else {
             GraphemeStyle {
-                syntax_style: syntax_highlighter.style,
+                syntax_style: syntax_highlighter.style.patch(background_highlighter.style),
                 overlay_style: overlay_highlighter.style.patch(concrete_highlighter.style),
             }
         };
@@ -329,7 +348,7 @@ impl<'a> TextRenderer<'a> {
         col: u16,
     ) -> bool {
         if (row as usize) < self.offset.row
-            || row >= self.viewport.height
+            || row as usize >= self.offset.row + self.viewport.height as usize
             || col >= self.viewport.width
         {
             return false;
@@ -448,7 +467,10 @@ impl<'a> TextRenderer<'a> {
     /// The indentation level is computed in `draw_lines`.
     /// Therefore this function must always be called afterwards.
     pub fn draw_indent_guides(&mut self, indent_level: usize, mut row: u16) {
-        if !self.draw_indent_guides || self.offset.row > row as usize {
+        if !self.draw_indent_guides
+            || self.offset.row > row as usize
+            || row as usize >= self.offset.row + self.viewport.height as usize
+        {
             return;
         }
         row -= self.offset.row as u16;
@@ -472,26 +494,47 @@ impl<'a> TextRenderer<'a> {
     }
 
     pub fn set_string(&mut self, x: u16, y: u16, string: &str, style: Style) {
-        if (y as usize) < self.offset.row {
+        if (y as usize) < self.offset.row
+            || y as usize >= self.offset.row + self.viewport.height as usize
+        {
             return;
         }
-        self.surface
-            .set_string(x, y + self.viewport.y, string, style)
+        self.surface.set_string(
+            x,
+            self.viewport.y + y - self.offset.row as u16,
+            string,
+            style,
+        )
     }
 
     pub fn set_stringn(&mut self, x: u16, y: u16, string: &str, width: usize, style: Style) {
-        if (y as usize) < self.offset.row {
+        if (y as usize) < self.offset.row
+            || y as usize >= self.offset.row + self.viewport.height as usize
+        {
             return;
         }
-        self.surface
-            .set_stringn(x, y + self.viewport.y, string, width, style);
+        self.surface.set_stringn(
+            x,
+            self.viewport.y + y - self.offset.row as u16,
+            string,
+            width,
+            style,
+        );
     }
 
     /// Sets the style of an area **within the text viewport* this accounts
     /// both for the renderers vertical offset and its viewport
     pub fn set_style(&mut self, mut area: Rect, style: Style) {
-        area = area.clip_top(self.offset.row as u16);
-        area.y += self.viewport.y;
+        let top = area.y.max(self.offset.row as u16);
+        let bottom = area
+            .bottom()
+            .min(self.offset.row as u16 + self.viewport.height);
+        area.y = top;
+        area.height = bottom.saturating_sub(top);
+        if area.area() == 0 {
+            return;
+        }
+        area.y = self.viewport.y + area.y - self.offset.row as u16;
         self.surface.set_style(area, style);
     }
 
@@ -506,18 +549,109 @@ impl<'a> TextRenderer<'a> {
         ellipsis: bool,
         truncate_start: bool,
     ) -> (u16, u16) {
-        if (y as usize) < self.offset.row {
+        if (y as usize) < self.offset.row
+            || y as usize >= self.offset.row + self.viewport.height as usize
+        {
             return (x, y);
         }
         self.surface.set_string_truncated(
             x,
-            y + self.viewport.y,
+            self.viewport.y + y - self.offset.row as u16,
             string,
             width,
             style,
             ellipsis,
             truncate_start,
         )
+    }
+
+    /// Render custom virtual text with the same grapheme, tab-stop,
+    /// whitespace-marker, horizontal-scroll, and viewport semantics as
+    /// document text.
+    pub fn draw_custom_text_line(&mut self, row: u16, text: &str, style: Style) {
+        if (row as usize) < self.offset.row
+            || row as usize >= self.offset.row + self.viewport.height as usize
+        {
+            return;
+        }
+
+        let y = self.viewport.y + row - self.offset.row as u16;
+        let visible_start = self.offset.col;
+        let visible_end = visible_start + self.viewport.width as usize;
+        let tab_width = self.tab.chars().count() as u16;
+        let mut col = 0usize;
+
+        for value in text.graphemes(true) {
+            let grapheme = Grapheme::new(value.into(), col, tab_width);
+            let width = grapheme.width();
+            let end = col + width;
+            if end <= visible_start {
+                col = end;
+                continue;
+            }
+            if col >= visible_end {
+                break;
+            }
+
+            let mut grapheme_style = style;
+            if grapheme.is_whitespace() {
+                grapheme_style = grapheme_style.patch(self.whitespace_style);
+            }
+            match grapheme {
+                Grapheme::Tab { width } => {
+                    let tab = &self.tab[..char_to_byte_idx(&self.tab, width)];
+                    let skip = visible_start.saturating_sub(col);
+                    let take = (visible_end.min(end) - col.max(visible_start)).min(width);
+                    let start_byte = char_to_byte_idx(tab, skip);
+                    let end_byte = char_to_byte_idx(tab, skip + take);
+                    let x = self.viewport.x
+                        + col.max(visible_start).saturating_sub(visible_start) as u16;
+                    self.surface
+                        .set_tab(x, y, &tab[start_byte..end_byte], grapheme_style);
+                }
+                Grapheme::Other { ref g } if g == " " => {
+                    if col >= visible_start && end <= visible_end {
+                        let x = self.viewport.x + (col - visible_start) as u16;
+                        self.surface
+                            .set_grapheme(x, y, &self.space, 1, grapheme_style);
+                    }
+                }
+                Grapheme::Other { ref g } if g == "\u{00A0}" => {
+                    if col >= visible_start && end <= visible_end {
+                        let x = self.viewport.x + (col - visible_start) as u16;
+                        self.surface
+                            .set_grapheme(x, y, &self.nbsp, 1, grapheme_style);
+                    }
+                }
+                Grapheme::Other { ref g } if g == "\u{202F}" => {
+                    if col >= visible_start && end <= visible_end {
+                        let x = self.viewport.x + (col - visible_start) as u16;
+                        self.surface
+                            .set_grapheme(x, y, &self.nnbsp, 1, grapheme_style);
+                    }
+                }
+                Grapheme::Other { ref g } if col >= visible_start && end <= visible_end => {
+                    let x = self.viewport.x + (col - visible_start) as u16;
+                    self.surface.set_grapheme(x, y, g, width, grapheme_style);
+                }
+                _ => {
+                    let start = col.max(visible_start);
+                    let clipped_width = visible_end.min(end).saturating_sub(start);
+                    if clipped_width != 0 {
+                        self.surface.set_style(
+                            Rect::new(
+                                self.viewport.x + (start - visible_start) as u16,
+                                y,
+                                clipped_width as u16,
+                                1,
+                            ),
+                            grapheme_style,
+                        );
+                    }
+                }
+            }
+            col = end;
+        }
     }
 }
 
@@ -620,5 +754,264 @@ impl<'t> OverlayHighlighter<'t> {
             acc.patch(self.theme.highlight(highlight))
         });
         self.update_pos();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use helix_core::{syntax, Rope};
+    use helix_view::{
+        annotations::custom_text::{
+            CustomLineBackground, CustomTextAnnotations, CustomVirtualLine,
+        },
+        editor::{Config, GutterConfig, WhitespaceRender, WhitespaceRenderValue},
+        graphics::{Color, Rect, Style},
+        view::ViewPosition,
+        Document, DocumentId, Theme, View,
+    };
+
+    use super::{render_document, TextRenderer};
+    use crate::ui::text_decorations::{
+        custom_text::add_custom_text_annotations, DecorationManager,
+    };
+    use tui::buffer::Buffer;
+
+    fn document(contents: &str, whitespace: bool) -> Document {
+        let mut config = Config::default();
+        if whitespace {
+            config.whitespace.render = WhitespaceRender::Basic(WhitespaceRenderValue::All);
+        }
+        Document::from(
+            Rope::from_str(contents),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(config))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        )
+    }
+
+    #[test]
+    fn renderer_translates_and_clips_styles_to_visible_rows() {
+        let doc = document("", false);
+        let theme = Theme::default();
+        let mut surface = Buffer::empty(Rect::new(0, 0, 10, 5));
+        surface.set_string(0, 4, "STATUS", Style::default());
+        let mut renderer = TextRenderer::new(
+            &mut surface,
+            &doc,
+            &theme,
+            helix_core::Position::new(2, 0),
+            Rect::new(2, 1, 6, 3),
+        );
+        let tint = Style::default().bg(Color::Rgb(1, 2, 3));
+
+        renderer.set_style(Rect::new(2, 3, 6, 1), tint);
+        renderer.set_style(Rect::new(2, 5, 6, 1), tint);
+
+        assert_eq!(surface[(2, 2)].bg, Color::Rgb(1, 2, 3));
+        assert_eq!(surface[(2, 4)].bg, Color::Reset);
+        assert_eq!(surface[(0, 4)].symbol.as_str(), "S");
+    }
+
+    #[test]
+    fn custom_text_honors_tabs_horizontal_scroll_unicode_and_whitespace() {
+        let doc = document("", true);
+        let mut theme = Theme::default();
+        theme.set(
+            "diff.minus".into(),
+            Style::default().fg(Color::Rgb(200, 20, 20)),
+        );
+        let mut surface = Buffer::empty(Rect::new(0, 0, 6, 1));
+        let mut renderer = TextRenderer::new(
+            &mut surface,
+            &doc,
+            &theme,
+            helix_core::Position::new(0, 2),
+            Rect::new(0, 0, 6, 1),
+        );
+
+        renderer.draw_custom_text_line(0, "a\t界 x", theme.get("diff.minus"));
+
+        assert_eq!(surface[(0, 0)].symbol.as_str(), " ");
+        assert_eq!(surface[(1, 0)].symbol.as_str(), " ");
+        assert_eq!(surface[(2, 0)].symbol.as_str(), "界");
+        assert_eq!(surface[(4, 0)].symbol.as_str(), "·");
+        assert_eq!(surface[(5, 0)].symbol.as_str(), "x");
+        assert_eq!(surface[(5, 0)].fg, Color::Rgb(200, 20, 20));
+    }
+
+    #[test]
+    fn viewport_can_begin_inside_consecutive_virtual_lines() {
+        let mut doc = document("anchor\nnext\n", false);
+        let mut view = View::new(DocumentId::default(), GutterConfig::default());
+        view.area = Rect::new(0, 0, 10, 2);
+        doc.ensure_view_init(view.id);
+        doc.set_custom_text_annotations(
+            view.id,
+            "test".into(),
+            CustomTextAnnotations {
+                virtual_lines: ["- one", "- two", "- three", "- four"]
+                    .into_iter()
+                    .map(|text| CustomVirtualLine {
+                        line: 0,
+                        text: text.into(),
+                        scope: "diff.minus".into(),
+                        background_opacity: None,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let mut theme = Theme::default();
+        theme.set(
+            "diff.minus".into(),
+            Style::default().fg(Color::Rgb(200, 20, 20)),
+        );
+        let annotations = view.text_annotations(&doc, Some(&theme));
+        let mut decorations = DecorationManager::default();
+        let mut overlays = Vec::new();
+        let mut concrete = Vec::new();
+        add_custom_text_annotations(
+            &doc,
+            view.id,
+            &theme,
+            &mut overlays,
+            &mut concrete,
+            &mut decorations,
+        );
+        let mut surface = Buffer::empty(Rect::new(0, 0, 10, 3));
+        surface.set_string(0, 2, "STATUS", Style::default());
+
+        render_document(
+            &mut surface,
+            Rect::new(0, 0, 10, 2),
+            &doc,
+            ViewPosition {
+                anchor: 0,
+                horizontal_offset: 0,
+                vertical_offset: 2,
+            },
+            &annotations,
+            None,
+            overlays,
+            concrete,
+            &theme,
+            decorations,
+        );
+
+        let row = |y| {
+            (0..10)
+                .map(|x| surface[(x, y)].symbol.as_str())
+                .collect::<String>()
+        };
+        assert!(row(0).starts_with("- two"));
+        assert!(row(1).starts_with("- three"));
+        assert!(row(2).starts_with("STATUS"));
+    }
+
+    #[test]
+    fn selection_background_stays_above_full_row_tint() {
+        let mut doc = document("added\n", false);
+        let mut view = View::new(DocumentId::default(), GutterConfig::default());
+        view.area = Rect::new(0, 0, 10, 1);
+        doc.ensure_view_init(view.id);
+        doc.set_custom_text_annotations(
+            view.id,
+            "test".into(),
+            CustomTextAnnotations {
+                line_backgrounds: vec![CustomLineBackground {
+                    line: 0,
+                    scope: "diff.plus".into(),
+                    opacity: 20,
+                }],
+                ..Default::default()
+            },
+        );
+        let mut theme = helix_view::theme::DEFAULT_THEME.clone();
+        let tint = Color::Rgb(10, 40, 10);
+        let selection = Color::Rgb(30, 60, 180);
+        theme.set("diff.plus".into(), Style::default().bg(tint));
+        theme.set("ui.selection".into(), Style::default().bg(selection));
+        let selection_scope = theme.find_highlight_exact("ui.selection").unwrap();
+        let annotations = view.text_annotations(&doc, Some(&theme));
+        let mut decorations = DecorationManager::default();
+        let mut overlays = vec![syntax::OverlayHighlights::single(selection_scope, 0..5)];
+        let mut concrete = Vec::new();
+        add_custom_text_annotations(
+            &doc,
+            view.id,
+            &theme,
+            &mut overlays,
+            &mut concrete,
+            &mut decorations,
+        );
+        let mut surface = Buffer::empty(Rect::new(0, 0, 10, 1));
+
+        render_document(
+            &mut surface,
+            Rect::new(0, 0, 10, 1),
+            &doc,
+            ViewPosition::default(),
+            &annotations,
+            None,
+            overlays,
+            concrete,
+            &theme,
+            decorations,
+        );
+
+        assert_eq!(surface[(0, 0)].bg, selection);
+        assert_eq!(surface[(9, 0)].bg, tint);
+    }
+
+    #[test]
+    fn stale_line_background_is_ignored_after_document_replacement() {
+        let mut doc = document("short\n", false);
+        let mut view = View::new(DocumentId::default(), GutterConfig::default());
+        view.area = Rect::new(0, 0, 10, 1);
+        doc.ensure_view_init(view.id);
+        doc.set_custom_text_annotations(
+            view.id,
+            "test".into(),
+            CustomTextAnnotations {
+                line_backgrounds: vec![CustomLineBackground {
+                    line: 8,
+                    scope: "diff.plus".into(),
+                    opacity: 20,
+                }],
+                ..Default::default()
+            },
+        );
+        let theme = helix_view::theme::DEFAULT_THEME.clone();
+        let annotations = view.text_annotations(&doc, Some(&theme));
+        let mut decorations = DecorationManager::default();
+        let mut overlays = Vec::new();
+        let mut concrete = Vec::new();
+        add_custom_text_annotations(
+            &doc,
+            view.id,
+            &theme,
+            &mut overlays,
+            &mut concrete,
+            &mut decorations,
+        );
+        let mut surface = Buffer::empty(Rect::new(0, 0, 10, 1));
+
+        render_document(
+            &mut surface,
+            Rect::new(0, 0, 10, 1),
+            &doc,
+            ViewPosition::default(),
+            &annotations,
+            None,
+            overlays,
+            concrete,
+            &theme,
+            decorations,
+        );
+
+        assert_eq!(surface[(9, 0)].bg, Color::Reset);
     }
 }

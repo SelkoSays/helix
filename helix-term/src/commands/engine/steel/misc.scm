@@ -332,6 +332,12 @@
 ;;lines `(line text scope)` rendered after the given zero-based document line.
 (define set-custom-text-annotations! helix.set-custom-text-annotations!)
 
+(provide set-custom-text-annotations-v2!)
+;;@doc
+;;Replace a namespace like `set-custom-text-annotations!`, plus line backgrounds
+;;as `(line scope opacity-percent)`. Virtual rows may add an opacity percentage.
+(define set-custom-text-annotations-v2! helix.set-custom-text-annotations-v2!)
+
 (provide clear-custom-text-annotations!)
 ;;@doc
 ;;Clear one custom annotation namespace in the focused view.
