@@ -13,6 +13,7 @@ pub struct CustomTextAnnotations {
     pub inline: Vec<CustomInlineAnnotation>,
     pub highlights: Vec<CustomHighlight>,
     pub virtual_lines: Vec<CustomVirtualLine>,
+    pub line_backgrounds: Vec<CustomLineBackground>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +43,16 @@ pub struct CustomVirtualLine {
     pub line: usize,
     pub text: String,
     pub scope: String,
+    /// Blend percentage used for a full-row background. An explicitly themed
+    /// scope background takes precedence over the blend.
+    pub background_opacity: Option<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CustomLineBackground {
+    pub line: usize,
+    pub scope: String,
+    pub opacity: u8,
 }
 
 #[derive(Debug, Default)]
@@ -193,6 +204,7 @@ mod tests {
                 line: 2,
                 text: "replacement".into(),
                 scope: "ui.text".into(),
+                background_opacity: None,
             }],
             ..Default::default()
         };

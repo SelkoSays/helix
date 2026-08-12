@@ -3764,6 +3764,9 @@ Return the focused view's visible zero-based line range as `(start end)`.
 Replace a namespace of focused-view annotations. Arguments are namespace,
 inline `(char text scope)` values, highlights `(start end scope)`, and virtual
 lines `(line text scope)` rendered after the given zero-based document line.
+### **set-custom-text-annotations-v2!**
+Replace a namespace like `set-custom-text-annotations!`, plus line backgrounds
+as `(line scope opacity-percent)`. Virtual rows may add an opacity percentage.
 ### **clear-custom-text-annotations!**
 Clear one custom annotation namespace in the focused view.
 ### **apply-custom-text-edits!**

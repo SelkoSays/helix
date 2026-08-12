@@ -1,7 +1,7 @@
 use helix_core::text_annotations::InlineAnnotation;
 use helix_view::annotations::custom_text::{
-    CustomHighlight, CustomHighlightStyle, CustomInlineAnnotation, CustomTextAnnotations,
-    CustomVirtualLine,
+    CustomHighlight, CustomHighlightStyle, CustomInlineAnnotation, CustomLineBackground,
+    CustomTextAnnotations, CustomVirtualLine,
 };
 use helix_view::graphics::Style;
 use steel::{
@@ -23,6 +23,11 @@ pub(super) fn register(module: &mut BuiltInModule) {
             CTX,
             "set-custom-text-annotations!",
             set_custom_text_annotations,
+        )
+        .register_fn_with_ctx(
+            CTX,
+            "set-custom-text-annotations-v2!",
+            set_custom_text_annotations_v2,
         )
         .register_fn_with_ctx(
             CTX,
@@ -61,6 +66,32 @@ fn set_custom_text_annotations(
         inline,
         highlights,
         virtual_lines,
+        SteelVal::ListV(Default::default()),
+    );
+    doc.set_custom_text_annotations(view_id, namespace.to_string(), annotations);
+    true
+}
+
+fn set_custom_text_annotations_v2(
+    cx: &mut Context,
+    namespace: SteelString,
+    inline: SteelVal,
+    highlights: SteelVal,
+    virtual_lines: SteelVal,
+    line_backgrounds: SteelVal,
+) -> bool {
+    let view_id = cx.editor.tree.focus;
+    let doc_id = cx.editor.tree.get(view_id).doc;
+    let Some(doc) = cx.editor.documents.get_mut(&doc_id) else {
+        return false;
+    };
+    let annotations = parse_annotations(
+        doc.text().len_chars(),
+        doc.text().len_lines().saturating_sub(1),
+        inline,
+        highlights,
+        virtual_lines,
+        line_backgrounds,
     );
     doc.set_custom_text_annotations(view_id, namespace.to_string(), annotations);
     true
@@ -82,6 +113,7 @@ fn parse_annotations(
     inline: SteelVal,
     highlights: SteelVal,
     virtual_lines: SteelVal,
+    line_backgrounds: SteelVal,
 ) -> CustomTextAnnotations {
     let inline = rows(inline)
         .into_iter()
@@ -111,17 +143,44 @@ fn parse_annotations(
     let virtual_lines = rows(virtual_lines)
         .into_iter()
         .filter_map(|row| match row.as_slice() {
-            [line, text, scope] => Some((integer(line)?, string(text)?, string(scope)?)),
+            [line, text, scope] => Some((integer(line)?, string(text)?, string(scope)?, None)),
+            [line, text, scope, opacity] => Some((
+                integer(line)?,
+                string(text)?,
+                string(scope)?,
+                Some(percentage(opacity)?),
+            )),
             _ => None,
         })
-        .filter(|(line, _, _)| *line <= last_line)
-        .map(|(line, text, scope)| CustomVirtualLine { line, text, scope })
+        .filter(|(line, _, _, opacity)| *line <= last_line && opacity.is_none_or(|v| v <= 100))
+        .map(
+            |(line, text, scope, background_opacity)| CustomVirtualLine {
+                line,
+                text,
+                scope,
+                background_opacity,
+            },
+        )
+        .collect();
+    let line_backgrounds = rows(line_backgrounds)
+        .into_iter()
+        .filter_map(|row| match row.as_slice() {
+            [line, scope, opacity] => Some((integer(line)?, string(scope)?, percentage(opacity)?)),
+            _ => None,
+        })
+        .filter(|(line, _, opacity)| *line <= last_line && *opacity <= 100)
+        .map(|(line, scope, opacity)| CustomLineBackground {
+            line,
+            scope,
+            opacity,
+        })
         .collect();
 
     CustomTextAnnotations {
         inline,
         highlights,
         virtual_lines,
+        line_backgrounds,
     }
 }
 
@@ -143,6 +202,10 @@ fn integer(value: &SteelVal) -> Option<usize> {
         SteelVal::IntV(value) if *value >= 0 => Some(*value as usize),
         _ => None,
     }
+}
+
+fn percentage(value: &SteelVal) -> Option<u8> {
+    integer(value).and_then(|value| u8::try_from(value).ok())
 }
 
 fn string(value: &SteelVal) -> Option<String> {
@@ -193,12 +256,21 @@ mod tests {
                 SteelVal::IntV(3),
                 string("deleted"),
                 string("diff.minus"),
+                SteelVal::IntV(20),
+            ])]),
+            list(vec![list(vec![
+                SteelVal::IntV(1),
+                string("diff.plus"),
+                SteelVal::IntV(20),
             ])]),
         );
 
         assert_eq!(annotations.inline.len(), 1);
         assert_eq!(annotations.highlights[0].range, 2..8);
         assert_eq!(annotations.virtual_lines[0].line, 3);
+        assert_eq!(annotations.virtual_lines[0].background_opacity, Some(20));
+        assert_eq!(annotations.line_backgrounds[0].line, 1);
+        assert_eq!(annotations.line_backgrounds[0].opacity, 20);
     }
 
     #[test]
@@ -220,10 +292,40 @@ mod tests {
                 string("bad"),
                 string("scope"),
             ])]),
+            list(vec![
+                list(vec![SteelVal::IntV(2), string("scope"), SteelVal::IntV(20)]),
+                list(vec![
+                    SteelVal::IntV(1),
+                    string("scope"),
+                    SteelVal::IntV(101),
+                ]),
+                list(vec![SteelVal::IntV(1), string("scope")]),
+            ]),
         );
 
         assert!(annotations.inline.is_empty());
         assert!(annotations.highlights.is_empty());
         assert!(annotations.virtual_lines.is_empty());
+        assert!(annotations.line_backgrounds.is_empty());
+    }
+
+    #[test]
+    fn v1_virtual_rows_remain_valid_without_backgrounds() {
+        let annotations = parse_annotations(
+            5,
+            1,
+            list(vec![]),
+            list(vec![]),
+            list(vec![list(vec![
+                SteelVal::IntV(1),
+                string("old"),
+                string("diff.minus"),
+            ])]),
+            list(vec![]),
+        );
+
+        assert_eq!(annotations.virtual_lines.len(), 1);
+        assert_eq!(annotations.virtual_lines[0].background_opacity, None);
+        assert!(annotations.line_backgrounds.is_empty());
     }
 }
