@@ -338,6 +338,12 @@
 ;;as `(line scope opacity-percent)`. Virtual rows may add an opacity percentage.
 (define set-custom-text-annotations-v2! helix.set-custom-text-annotations-v2!)
 
+(provide set-custom-text-annotations-v3!)
+;;@doc
+;;Replace a namespace like `set-custom-text-annotations-v2!`; virtual-row
+;;anchor -1 renders before the first document line.
+(define set-custom-text-annotations-v3! helix.set-custom-text-annotations-v3!)
+
 (provide clear-custom-text-annotations!)
 ;;@doc
 ;;Clear one custom annotation namespace in the focused view.

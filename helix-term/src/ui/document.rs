@@ -78,9 +78,13 @@ pub fn render_text(
     theme: &Theme,
     mut decorations: DecorationManager,
 ) {
-    let row_off = visual_offset_from_block(text, anchor, anchor, text_fmt, text_annotations)
-        .0
-        .row;
+    let row_off = if anchor == 0 {
+        0
+    } else {
+        visual_offset_from_block(text, anchor, anchor, text_fmt, text_annotations)
+            .0
+            .row
+    };
 
     let mut formatter =
         DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, text_annotations, anchor);
@@ -93,6 +97,10 @@ pub fn render_text(
     let mut background_highlighter =
         ConcreteStyleHighlighter::new_at(background_highlights, anchor);
     let mut concrete_highlighter = ConcreteStyleHighlighter::new_at(concrete_highlights, anchor);
+
+    if anchor == 0 {
+        decorations.render_leading_lines(renderer);
+    }
 
     let mut last_line_pos = LinePos {
         first_visual_line: false,
@@ -908,6 +916,149 @@ mod tests {
         };
         assert!(row(0).starts_with("- two"));
         assert!(row(1).starts_with("- three"));
+        assert!(row(2).starts_with("STATUS"));
+    }
+
+    #[test]
+    fn leading_virtual_lines_reserve_rows_and_use_the_normal_clipped_renderer() {
+        let mut doc = document("first\nnext\n", true);
+        let mut view = View::new(DocumentId::default(), GutterConfig::default());
+        view.area = Rect::new(0, 0, 6, 2);
+        doc.ensure_view_init(view.id);
+        doc.set_custom_text_annotations(
+            view.id,
+            "test".into(),
+            CustomTextAnnotations {
+                virtual_lines: ["hidden", "a\t界 x"]
+                    .into_iter()
+                    .map(|text| CustomVirtualLine {
+                        line: -1,
+                        text: text.into(),
+                        scope: "diff.minus".into(),
+                        background_opacity: Some(20),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let mut theme = Theme::default();
+        let background = Color::Rgb(9, 8, 7);
+        theme.set(
+            "diff.minus".into(),
+            Style::default().fg(Color::Rgb(200, 20, 20)).bg(background),
+        );
+        let annotations = view.text_annotations(&doc, Some(&theme));
+        let text_format = doc.text_format(6, Some(&theme));
+        assert_eq!(
+            helix_core::visual_offset_from_block(
+                doc.text().slice(..),
+                0,
+                0,
+                &text_format,
+                &annotations,
+            )
+            .0
+            .row,
+            2
+        );
+        assert_eq!(
+            helix_core::visual_offset_from_anchor(
+                doc.text().slice(..),
+                0,
+                0,
+                &text_format,
+                &annotations,
+                usize::MAX,
+            )
+            .unwrap()
+            .0
+            .row,
+            2
+        );
+        assert_eq!(
+            view.text_pos_at_visual_coords(&doc, 0, 0, text_format.clone(), &annotations, true),
+            None
+        );
+        assert_eq!(
+            view.text_pos_at_visual_coords(&doc, 1, 0, text_format.clone(), &annotations, true),
+            None
+        );
+        assert_eq!(
+            view.text_pos_at_visual_coords(&doc, 2, 0, text_format, &annotations, true),
+            Some(0)
+        );
+        assert_eq!(
+            helix_core::char_idx_at_visual_offset(
+                doc.text().slice(..),
+                0,
+                0,
+                0,
+                &doc.text_format(6, Some(&theme)),
+                &annotations,
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            helix_core::char_idx_at_visual_offset(
+                doc.text().slice(..),
+                0,
+                1,
+                0,
+                &doc.text_format(6, Some(&theme)),
+                &annotations,
+            ),
+            (0, 1)
+        );
+        assert_eq!(
+            helix_core::char_idx_at_visual_offset(
+                doc.text().slice(..),
+                0,
+                2,
+                0,
+                &doc.text_format(6, Some(&theme)),
+                &annotations,
+            ),
+            (0, 2)
+        );
+        let mut decorations = DecorationManager::default();
+        let mut overlays = Vec::new();
+        let mut concrete = Vec::new();
+        add_custom_text_annotations(
+            &doc,
+            view.id,
+            &theme,
+            &mut overlays,
+            &mut concrete,
+            &mut decorations,
+        );
+        let mut surface = Buffer::empty(Rect::new(0, 0, 6, 3));
+        surface.set_string(0, 2, "STATUS", Style::default());
+
+        render_document(
+            &mut surface,
+            Rect::new(0, 0, 6, 2),
+            &doc,
+            ViewPosition {
+                anchor: 0,
+                horizontal_offset: 2,
+                vertical_offset: 1,
+            },
+            &annotations,
+            None,
+            overlays,
+            concrete,
+            &theme,
+            decorations,
+        );
+
+        let row = |y| {
+            (0..6)
+                .map(|x| surface[(x, y)].symbol.as_str())
+                .collect::<String>()
+        };
+        assert_eq!(row(0), "  界 ·x");
+        assert!(row(1).starts_with("rst"));
+        assert_eq!(surface[(5, 0)].bg, background);
         assert!(row(2).starts_with("STATUS"));
     }
 

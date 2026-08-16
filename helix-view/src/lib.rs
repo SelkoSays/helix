@@ -72,14 +72,21 @@ pub fn align_view(doc: &mut Document, view: &View, align: Align) {
     };
 
     let text_fmt = doc.text_format(viewport.width, None);
+    let annotations = view.text_annotations(doc, None);
+    let leading = if cursor == 0 {
+        annotations.virtual_lines_before_first_line() as isize
+    } else {
+        0
+    };
     (view_offset.anchor, view_offset.vertical_offset) = char_idx_at_visual_offset(
         doc_text,
         cursor,
-        -(relative as isize),
+        leading - relative as isize,
         0,
         &text_fmt,
-        &view.text_annotations(doc, None),
+        &annotations,
     );
+    drop(annotations);
     doc.set_view_offset(view.id, view_offset);
 }
 

@@ -31,6 +31,11 @@ pub(super) fn register(module: &mut BuiltInModule) {
         )
         .register_fn_with_ctx(
             CTX,
+            "set-custom-text-annotations-v3!",
+            set_custom_text_annotations_v3,
+        )
+        .register_fn_with_ctx(
+            CTX,
             "clear-custom-text-annotations!",
             clear_custom_text_annotations,
         );
@@ -67,6 +72,7 @@ fn set_custom_text_annotations(
         highlights,
         virtual_lines,
         SteelVal::ListV(Default::default()),
+        false,
     );
     doc.set_custom_text_annotations(view_id, namespace.to_string(), annotations);
     true
@@ -92,6 +98,33 @@ fn set_custom_text_annotations_v2(
         highlights,
         virtual_lines,
         line_backgrounds,
+        false,
+    );
+    doc.set_custom_text_annotations(view_id, namespace.to_string(), annotations);
+    true
+}
+
+fn set_custom_text_annotations_v3(
+    cx: &mut Context,
+    namespace: SteelString,
+    inline: SteelVal,
+    highlights: SteelVal,
+    virtual_lines: SteelVal,
+    line_backgrounds: SteelVal,
+) -> bool {
+    let view_id = cx.editor.tree.focus;
+    let doc_id = cx.editor.tree.get(view_id).doc;
+    let Some(doc) = cx.editor.documents.get_mut(&doc_id) else {
+        return false;
+    };
+    let annotations = parse_annotations(
+        doc.text().len_chars(),
+        doc.text().len_lines().saturating_sub(1),
+        inline,
+        highlights,
+        virtual_lines,
+        line_backgrounds,
+        true,
     );
     doc.set_custom_text_annotations(view_id, namespace.to_string(), annotations);
     true
@@ -114,6 +147,7 @@ fn parse_annotations(
     highlights: SteelVal,
     virtual_lines: SteelVal,
     line_backgrounds: SteelVal,
+    allow_leading_virtual_lines: bool,
 ) -> CustomTextAnnotations {
     let inline = rows(inline)
         .into_iter()
@@ -143,16 +177,23 @@ fn parse_annotations(
     let virtual_lines = rows(virtual_lines)
         .into_iter()
         .filter_map(|row| match row.as_slice() {
-            [line, text, scope] => Some((integer(line)?, string(text)?, string(scope)?, None)),
+            [line, text, scope] => Some((
+                virtual_line_anchor(line, allow_leading_virtual_lines)?,
+                string(text)?,
+                string(scope)?,
+                None,
+            )),
             [line, text, scope, opacity] => Some((
-                integer(line)?,
+                virtual_line_anchor(line, allow_leading_virtual_lines)?,
                 string(text)?,
                 string(scope)?,
                 Some(percentage(opacity)?),
             )),
             _ => None,
         })
-        .filter(|(line, _, _, opacity)| *line <= last_line && opacity.is_none_or(|v| v <= 100))
+        .filter(|(line, _, _, opacity)| {
+            *line <= last_line as isize && opacity.is_none_or(|v| v <= 100)
+        })
         .map(
             |(line, text, scope, background_opacity)| CustomVirtualLine {
                 line,
@@ -200,6 +241,14 @@ fn rows(value: SteelVal) -> Vec<Vec<SteelVal>> {
 fn integer(value: &SteelVal) -> Option<usize> {
     match value {
         SteelVal::IntV(value) if *value >= 0 => Some(*value as usize),
+        _ => None,
+    }
+}
+
+fn virtual_line_anchor(value: &SteelVal, allow_leading: bool) -> Option<isize> {
+    match value {
+        SteelVal::IntV(value) if *value >= 0 => isize::try_from(*value).ok(),
+        SteelVal::IntV(-1) if allow_leading => Some(-1),
         _ => None,
     }
 }
@@ -263,6 +312,7 @@ mod tests {
                 string("diff.plus"),
                 SteelVal::IntV(20),
             ])]),
+            false,
         );
 
         assert_eq!(annotations.inline.len(), 1);
@@ -287,11 +337,14 @@ mod tests {
                 list(vec![SteelVal::IntV(3), SteelVal::IntV(3), string("scope")]),
                 list(vec![SteelVal::IntV(1), SteelVal::IntV(6), string("scope")]),
             ]),
-            list(vec![list(vec![
-                SteelVal::IntV(2),
-                string("bad"),
-                string("scope"),
-            ])]),
+            list(vec![
+                list(vec![
+                    SteelVal::IntV(-1),
+                    string("v1/v2 cannot lead"),
+                    string("scope"),
+                ]),
+                list(vec![SteelVal::IntV(2), string("bad"), string("scope")]),
+            ]),
             list(vec![
                 list(vec![SteelVal::IntV(2), string("scope"), SteelVal::IntV(20)]),
                 list(vec![
@@ -301,6 +354,7 @@ mod tests {
                 ]),
                 list(vec![SteelVal::IntV(1), string("scope")]),
             ]),
+            false,
         );
 
         assert!(annotations.inline.is_empty());
@@ -322,10 +376,44 @@ mod tests {
                 string("diff.minus"),
             ])]),
             list(vec![]),
+            false,
         );
 
         assert_eq!(annotations.virtual_lines.len(), 1);
         assert_eq!(annotations.virtual_lines[0].background_opacity, None);
         assert!(annotations.line_backgrounds.is_empty());
+    }
+
+    #[test]
+    fn v3_accepts_only_the_leading_signed_anchor() {
+        let annotations = parse_annotations(
+            5,
+            1,
+            list(vec![]),
+            list(vec![]),
+            list(vec![
+                list(vec![
+                    SteelVal::IntV(-2),
+                    string("too low"),
+                    string("diff.minus"),
+                ]),
+                list(vec![
+                    SteelVal::IntV(-1),
+                    string("leading"),
+                    string("diff.minus"),
+                ]),
+                list(vec![
+                    SteelVal::IntV(2),
+                    string("past document"),
+                    string("diff.minus"),
+                ]),
+            ]),
+            list(vec![]),
+            true,
+        );
+
+        assert_eq!(annotations.virtual_lines.len(), 1);
+        assert_eq!(annotations.virtual_lines[0].line, -1);
+        assert_eq!(annotations.virtual_lines[0].text, "leading");
     }
 }

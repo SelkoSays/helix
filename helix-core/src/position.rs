@@ -197,7 +197,15 @@ pub fn visual_offset_from_anchor(
 ) -> Result<(Position, usize), VisualOffsetError> {
     let mut formatter =
         DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, anchor);
-    let mut anchor_line = None;
+    // Anchor zero is also the only representable boundary before leading
+    // virtual rows. Treat it as the start of that block instead of the visual
+    // line containing the first real grapheme.
+    let leading_virtual_lines = if anchor == 0 {
+        annotations.virtual_lines_before_first_line()
+    } else {
+        0
+    };
+    let mut anchor_line = (leading_virtual_lines != 0).then_some(0);
     let mut found_pos = None;
     let mut last_pos = Position::default();
 
@@ -365,6 +373,25 @@ pub fn char_idx_at_visual_offset(
     text_fmt: &TextFormat,
     annotations: &TextAnnotations,
 ) -> (usize, usize) {
+    let leading_virtual_lines = if anchor == 0 {
+        annotations.virtual_lines_before_first_line()
+    } else {
+        0
+    };
+    if leading_virtual_lines != 0 {
+        let target_row = row_offset.max(0) as usize;
+        let (char_idx, virtual_rows) =
+            char_idx_at_visual_block_offset(text, 0, target_row, column, text_fmt, annotations);
+        // Leading virtual rows and the first real row all share character
+        // index zero. Preserve their position as the view's vertical offset
+        // until traversal advances to a later document line.
+        return if char_idx == 0 {
+            (0, target_row.min(leading_virtual_lines))
+        } else {
+            (char_idx, virtual_rows)
+        };
+    }
+
     let mut pos = anchor;
     // convert row relative to visual line containing anchor to row relative to a block containing anchor (anchor may change)
     loop {
@@ -416,6 +443,15 @@ pub fn char_idx_at_visual_block_offset(
     text_fmt: &TextFormat,
     annotations: &TextAnnotations,
 ) -> (usize, usize) {
+    let leading_virtual_lines = if anchor == 0 {
+        annotations.virtual_lines_before_first_line()
+    } else {
+        0
+    };
+    if row < leading_virtual_lines {
+        return (0, row);
+    }
+
     let mut formatter =
         DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, anchor);
     let mut last_char_idx = formatter.next_char_pos();

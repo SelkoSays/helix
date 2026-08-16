@@ -23,6 +23,15 @@ mod diagnostics;
 /// To reserve space for virtual text lines (which is then filled by this trait) emit appropriate
 /// [`LineAnnotation`](helix_core::text_annotations::LineAnnotation)s in [`helix_view::View::text_annotations`]
 pub trait Decoration {
+    /// Render rows reserved before the first document line.
+    fn render_leading_lines(
+        &mut self,
+        _renderer: &mut TextRenderer,
+        _virt_off: Position,
+    ) -> Position {
+        Position::new(0, 0)
+    }
+
     /// Called **before** a **visual** line is rendered. A visual line does not
     /// necessarily correspond to a single line in a document as soft wrapping can
     /// spread a single document line across multiple visual lines.
@@ -128,6 +137,13 @@ impl<'a> DecorationManager<'a> {
     pub fn decorate_line(&mut self, renderer: &mut TextRenderer, pos: LinePos) {
         for (decoration, _) in &mut self.decorations {
             decoration.decorate_line(renderer, pos);
+        }
+    }
+
+    pub fn render_leading_lines(&mut self, renderer: &mut TextRenderer) {
+        let mut virt_off = Position::new(0, 0);
+        for (decoration, _) in &mut self.decorations {
+            virt_off += decoration.render_leading_lines(renderer, virt_off);
         }
     }
 

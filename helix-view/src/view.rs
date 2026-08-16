@@ -9,7 +9,7 @@ use crate::{
 };
 
 use helix_core::{
-    char_idx_at_visual_offset,
+    char_idx_at_visual_block_offset, char_idx_at_visual_offset,
     doc_formatter::TextFormat,
     text_annotations::TextAnnotations,
     visual_offset_from_anchor, visual_offset_from_block, Position, RopeSlice, Selection,
@@ -311,8 +311,19 @@ impl View {
             } else {
                 viewport.height as isize - scrolloff_bottom as isize - 1
             };
-            (offset.anchor, offset.vertical_offset) =
-                char_idx_at_visual_offset(doc_text, cursor, -v_off, 0, &text_fmt, &annotations);
+            let leading = if cursor == 0 {
+                annotations.virtual_lines_before_first_line() as isize
+            } else {
+                0
+            };
+            (offset.anchor, offset.vertical_offset) = char_idx_at_visual_offset(
+                doc_text,
+                cursor,
+                leading - v_off,
+                0,
+                &text_fmt,
+                &annotations,
+            );
         }
 
         if text_fmt.soft_wrap {
@@ -577,17 +588,24 @@ impl View {
         let text_row = row as usize + view_offset.vertical_offset;
         let text_col = column as usize + view_offset.horizontal_offset;
 
-        let (char_idx, virt_lines) = char_idx_at_visual_offset(
-            text,
-            view_offset.anchor,
-            text_row as isize,
-            text_col,
-            &text_fmt,
-            annotations,
-        );
+        let leading = annotations.virtual_lines_before_first_line();
+        let (char_idx, virt_lines) = if view_offset.anchor == 0 && leading != 0 {
+            char_idx_at_visual_block_offset(text, 0, text_row, text_col, &text_fmt, annotations)
+        } else {
+            char_idx_at_visual_offset(
+                text,
+                view_offset.anchor,
+                text_row as isize,
+                text_col,
+                &text_fmt,
+                annotations,
+            )
+        };
 
         // if the cursor is on a line with only virtual text return None
-        if virt_lines != 0 && ignore_virtual_text {
+        if ignore_virtual_text
+            && (virt_lines != 0 || (view_offset.anchor == 0 && text_row < leading))
+        {
             return None;
         }
         Some(char_idx)

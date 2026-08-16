@@ -113,6 +113,12 @@ impl Overlay {
 /// caches is preferable as otherwise a lot of lifetimes become invariant
 /// which complicates APIs a lot.
 pub trait LineAnnotation {
+    /// Reserve virtual rows before the first document line. This is queried
+    /// only when formatting the first document block.
+    fn insert_virtual_lines_before_first_line(&mut self) -> Position {
+        Position::new(0, 0)
+    }
+
     /// Resets the internal position to `char_idx`. This function is called
     /// when a new traversal of a document starts.
     ///
@@ -418,6 +424,15 @@ impl<'a> TextAnnotations<'a> {
                     .get()
                     .insert_virtual_lines(char_idx, line_end_visual_pos + virt_off, doc_line)
             };
+        }
+        virt_off.row
+    }
+
+    /// Return the virtual height reserved before the first document line.
+    pub fn virtual_lines_before_first_line(&self) -> usize {
+        let mut virt_off = Position::new(0, 0);
+        for (_, layer) in &self.line_annotations {
+            virt_off += unsafe { layer.get().insert_virtual_lines_before_first_line() };
         }
         virt_off.row
     }
