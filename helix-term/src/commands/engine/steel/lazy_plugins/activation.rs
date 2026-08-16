@@ -9,15 +9,18 @@ pub(super) enum ActivationWork {
     Call,
 }
 
-pub(super) fn begin_activation(command: &str) -> Result<(String, ActivationWork), SteelErr> {
+fn begin_plugin_activation(
+    plugin_name: &str,
+    supersede_precompile: bool,
+    retry_command: Option<&str>,
+) -> Result<ActivationWork, SteelErr> {
     let (lock, condvar) = &*REGISTRY;
     let mut registry = lock.lock().unwrap();
-    let Some(plugin_name) = registry.commands.get(command).cloned() else {
+    let Some(plugin) = registry.plugins.get_mut(plugin_name) else {
         return Err(lazy_error(format!(
-            "lazy command {command:?} disappeared during engine reload"
+            "lazy plugin {plugin_name:?} disappeared during engine reload"
         )));
     };
-    let plugin = registry.plugins.get_mut(&plugin_name).unwrap();
     let work = match &mut plugin.state {
         ActivationState::Unloaded | ActivationState::FallbackPending => {
             let modules = plugin.modules.clone();
@@ -39,15 +42,42 @@ pub(super) fn begin_activation(command: &str) -> Result<(String, ActivationWork)
                 "recursive activation of lazy plugin {plugin_name:?}"
             )))
         }
+        ActivationState::Queued { .. } | ActivationState::Precompiling { .. }
+            if supersede_precompile =>
+        {
+            let modules = plugin.modules.clone();
+            plugin.state = ActivationState::Activating;
+            condvar.notify_all();
+            ActivationWork::Compile(modules)
+        }
         ActivationState::Queued { .. } | ActivationState::Precompiling { .. } => {
             plugin.state = ActivationState::FallbackPending;
             condvar.notify_all();
+            let retry = retry_command
+                .map(|command| format!("; invoke {command:?} again to load it normally"))
+                .unwrap_or_default();
             return Err(lazy_error(format!(
-                "lazy plugin {plugin_name:?} is still precompiling; invoke {command:?} again to load it normally"
+                "lazy plugin {plugin_name:?} is still precompiling{retry}"
             )));
         }
     };
-    Ok((plugin_name, work))
+    Ok(work)
+}
+
+pub(super) fn begin_activation(command: &str) -> Result<(String, ActivationWork), SteelErr> {
+    let plugin_name = REGISTRY
+        .0
+        .lock()
+        .unwrap()
+        .commands
+        .get(command)
+        .cloned()
+        .ok_or_else(|| {
+            lazy_error(format!(
+                "lazy command {command:?} disappeared during engine reload"
+            ))
+        })?;
+    begin_plugin_activation(&plugin_name, false, Some(command)).map(|work| (plugin_name, work))
 }
 
 pub(super) enum ActivationCompletion<'a> {
@@ -160,9 +190,17 @@ pub(super) fn activate_and_call(
     args: Vec<SteelVal>,
 ) -> Result<SteelVal, SteelErr> {
     let (plugin_name, work) = begin_activation(command)?;
-    let activation = !matches!(work, ActivationWork::Call);
+    complete_activation(engine, &plugin_name, work, false)?;
+    call_resolved_function_by_name(engine, command, args)
+}
 
-    if activation {
+fn complete_activation(
+    engine: &mut Engine,
+    plugin_name: &str,
+    work: ActivationWork,
+    foreground_fallback: bool,
+) -> Result<(), SteelErr> {
+    if !matches!(work, ActivationWork::Call) {
         let load_result = match work {
             ActivationWork::Compile(modules) => {
                 let result = compile_and_run_modules(engine, &modules);
@@ -175,9 +213,12 @@ pub(super) fn activate_and_call(
                 Ok(()) => Ok(()),
                 Err(ArtifactLoadError::Execution(error)) => Err(error),
                 Err(ArtifactLoadError::Safe(message)) => {
-                    finish_activation(&plugin_name, ActivationCompletion::FallbackPending);
+                    finish_activation(plugin_name, ActivationCompletion::FallbackPending);
+                    if foreground_fallback {
+                        return activate_plugin(engine, plugin_name);
+                    }
                     return Err(lazy_error(format!(
-                        "unable to load precompiled lazy plugin {plugin_name:?}: {message}; invoke {command:?} again to load it normally"
+                        "unable to load precompiled lazy plugin {plugin_name:?}: {message}; invoke its command again to load it normally"
                     )));
                 }
             },
@@ -185,7 +226,7 @@ pub(super) fn activate_and_call(
         };
 
         if let Err(error) = load_result {
-            finish_activation(&plugin_name, ActivationCompletion::Failed(&error));
+            finish_activation(plugin_name, ActivationCompletion::Failed(&error));
             return Err(error);
         }
 
@@ -195,7 +236,7 @@ pub(super) fn activate_and_call(
                 let registry = lock.lock().unwrap();
                 registry
                     .plugins
-                    .get(&plugin_name)
+                    .get(plugin_name)
                     .map(|plugin| plugin.initializers.clone())
                     .ok_or_else(|| {
                         lazy_error(format!(
@@ -210,11 +251,16 @@ pub(super) fn activate_and_call(
         })();
 
         if let Err(error) = initialization_result {
-            finish_activation(&plugin_name, ActivationCompletion::Failed(&error));
+            finish_activation(plugin_name, ActivationCompletion::Failed(&error));
             return Err(error);
         }
-        finish_activation(&plugin_name, ActivationCompletion::Loaded);
+        finish_activation(plugin_name, ActivationCompletion::Loaded);
     }
 
-    call_resolved_function_by_name(engine, command, args)
+    Ok(())
+}
+
+pub(super) fn activate_plugin(engine: &mut Engine, plugin_name: &str) -> Result<(), SteelErr> {
+    let work = begin_plugin_activation(plugin_name, true, None)?;
+    complete_activation(engine, plugin_name, work, true)
 }

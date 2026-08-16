@@ -3280,6 +3280,12 @@ fn run_initialization_script(
                 match std::fs::read_to_string(&path) {
                     Ok(contents) => {
                         log::info!("Loading trusted workspace Steel config: {:?}", path);
+                        if let Err(e) =
+                            lazy_plugins::materialize_local_dependencies(guard, &contents, &path)
+                        {
+                            present_error_inside_engine_context(cx, guard, e);
+                            return;
+                        }
                         if let Err(e) = guard.run_with_reference_from_path::<Context, Context>(
                             cx, CTX, &contents, path,
                         ) {

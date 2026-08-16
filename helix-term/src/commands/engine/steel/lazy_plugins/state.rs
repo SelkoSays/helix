@@ -5,7 +5,7 @@
 //! acquire the registry lock while the loader lock is held.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Condvar, Mutex},
 };
 
@@ -39,6 +39,19 @@ pub(super) struct Plugin {
     pub(super) initializers: Vec<String>,
     pub(super) kind: RegistrationKind,
     pub(super) state: ActivationState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LogicalStrategy {
+    Lazy,
+    Eager,
+}
+
+pub(super) struct LogicalPlugin {
+    pub(super) eager_modules: Vec<String>,
+    pub(super) manifests: Vec<String>,
+    pub(super) builtin: bool,
+    pub(super) strategy: Option<LogicalStrategy>,
 }
 
 impl Plugin {
@@ -86,6 +99,9 @@ pub(super) struct Registry {
     pub(super) commands: HashMap<String, String>,
     pub(super) docs: HashMap<String, String>,
     pub(super) registration_order: Vec<String>,
+    pub(super) logical_plugins: HashMap<String, LogicalPlugin>,
+    pub(super) logical_registration_order: Vec<String>,
+    pub(super) locally_loaded_commands: HashSet<String>,
     pub(super) initialization_finished: bool,
     pub(super) next_job_id: u64,
 }

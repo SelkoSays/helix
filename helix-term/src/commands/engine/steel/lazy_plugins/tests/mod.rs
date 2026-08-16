@@ -42,5 +42,6 @@ fn register_prefixed_builtin(engine: &mut Engine) {
 mod discovery;
 mod failures;
 mod loading;
+mod local_dependencies;
 mod precompile;
 mod registration;
