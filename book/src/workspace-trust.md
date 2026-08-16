@@ -4,7 +4,8 @@ Helix has several features that can execute arbitrary code:
 
 - Language servers (LSP)
 - Debug adapters (DAP)
-- Local workspace configuration (`.helix/config.toml`, `.helix/languages.toml`)
+- Local workspace configuration (`.helix/config.toml`, `.helix/languages.toml`,
+  `.helix/local.scm`)
 - Git integration (filters and other commands in a repository's `.git/config`)
 
 To protect against malicious projects (a checked-out PR, a freshly cloned
@@ -57,8 +58,23 @@ not loaded. Run `:workspace-trust` to re-allow.
 
 In the stale state, language servers continue to run (they use the
 globally-configured binaries on `$PATH`, which are unchanged), but
-`.helix/config.toml` and `.helix/languages.toml` are not loaded. Run
+`.helix/config.toml`, `.helix/languages.toml`, and `.helix/local.scm` are not loaded. Run
 `:workspace-trust` again to re-pin the new hash.
+
+## Workspace Steel dependencies
+
+When the unified Steel plugin loader is installed, a trusted
+`.helix/local.scm` may contain one literal top-level dependency declaration:
+
+```scheme
+(local-plugin-dependencies '(tasks jobs))
+```
+
+Helix resolves the declaration before compiling the rest of the local file.
+Registered lazy plugins activate through their existing loader; a cataloged
+built-in omitted from global selection loads for the current configuration
+generation. The declaration is never parsed or activated for an untrusted,
+excluded, or stale workspace.
 
 ## Storage
 

@@ -15,7 +15,14 @@ pub(super) fn validate_global_collisions(engine: &Engine) {
     let collisions = registry
         .commands
         .iter()
-        .filter(|(command, _)| engine.global_exists(command))
+        .filter(|(command, plugin)| {
+            engine.global_exists(command)
+                && !registry.locally_loaded_commands.contains(command.as_str())
+                && registry
+                    .plugins
+                    .get(plugin.as_str())
+                    .is_none_or(|plugin| !matches!(plugin.state, ActivationState::Loaded))
+        })
         .map(|(command, plugin)| (command.clone(), plugin.clone()))
         .collect::<Vec<_>>();
     for (command, plugin) in collisions {
