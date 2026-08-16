@@ -39,8 +39,9 @@ pub enum CustomHighlightStyle {
 
 #[derive(Clone, Debug)]
 pub struct CustomVirtualLine {
-    /// The document line after which this virtual line is rendered.
-    pub line: usize,
+    /// The document line after which this virtual line is rendered. `-1`
+    /// denotes a row before the first document line.
+    pub line: isize,
     pub text: String,
     pub scope: String,
     /// Blend percentage used for a full-row background. An explicitly themed
@@ -119,6 +120,10 @@ struct CustomVirtualLines<'a> {
 }
 
 impl LineAnnotation for CustomVirtualLines<'_> {
+    fn insert_virtual_lines_before_first_line(&mut self) -> Position {
+        Position::new(self.lines.iter().filter(|line| line.line == -1).count(), 0)
+    }
+
     fn insert_virtual_lines(
         &mut self,
         _line_end_char_idx: usize,
@@ -128,7 +133,7 @@ impl LineAnnotation for CustomVirtualLines<'_> {
         Position::new(
             self.lines
                 .iter()
-                .filter(|line| line.line == doc_line)
+                .filter(|line| line.line >= 0 && line.line as usize == doc_line)
                 .count(),
             0,
         )

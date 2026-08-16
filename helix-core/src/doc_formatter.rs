@@ -215,11 +215,19 @@ impl<'t> DocumentFormatter<'t> {
         let block_line_idx = text.char_to_line(char_idx.min(text.len_chars()));
         let block_char_idx = text.line_to_char(block_line_idx);
         annotations.reset_pos(block_char_idx);
+        let leading_virtual_lines = if block_line_idx == 0 {
+            annotations.virtual_lines_before_first_line()
+        } else {
+            0
+        };
 
         DocumentFormatter {
             text_fmt,
             annotations,
-            visual_pos: Position { row: 0, col: 0 },
+            visual_pos: Position {
+                row: leading_virtual_lines,
+                col: 0,
+            },
             graphemes: text.slice(block_char_idx..).graphemes(),
             char_pos: block_char_idx,
             exhausted: false,

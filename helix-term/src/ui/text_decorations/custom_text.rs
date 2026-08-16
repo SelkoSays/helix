@@ -25,6 +25,29 @@ struct CustomLineBackgrounds<'a> {
     theme: &'a Theme,
 }
 
+impl CustomVirtualText<'_> {
+    fn render_lines(
+        &self,
+        renderer: &mut TextRenderer,
+        lines: &[&CustomVirtualLine],
+        start_row: u16,
+    ) {
+        for (index, line) in lines.iter().enumerate() {
+            let row = start_row + index as u16;
+            let mut style = self.theme.get(&line.scope);
+            if let Some(opacity) = line.background_opacity {
+                let background = background_style(self.theme, &line.scope, opacity);
+                renderer.set_style(
+                    Rect::new(renderer.viewport.x, row, renderer.viewport.width, 1),
+                    background,
+                );
+                style = style.patch(background);
+            }
+            renderer.draw_custom_text_line(row, &line.text, style);
+        }
+    }
+}
+
 impl Decoration for CustomLineBackgrounds<'_> {
     fn decorate_line(&mut self, renderer: &mut TextRenderer, pos: LinePos) {
         for line in self.lines.iter().filter(|line| line.line == pos.doc_line) {
@@ -43,6 +66,21 @@ impl Decoration for CustomLineBackgrounds<'_> {
 }
 
 impl Decoration for CustomVirtualText<'_> {
+    fn render_leading_lines(
+        &mut self,
+        renderer: &mut TextRenderer,
+        virt_off: Position,
+    ) -> Position {
+        let lines: Vec<_> = self
+            .lines
+            .iter()
+            .copied()
+            .filter(|line| line.line == -1)
+            .collect();
+        self.render_lines(renderer, &lines, virt_off.row as u16);
+        Position::new(lines.len(), 0)
+    }
+
     fn render_virt_lines(
         &mut self,
         renderer: &mut TextRenderer,
@@ -52,21 +90,10 @@ impl Decoration for CustomVirtualText<'_> {
         let lines: Vec<_> = self
             .lines
             .iter()
-            .filter(|line| line.line == pos.doc_line)
+            .copied()
+            .filter(|line| line.line >= 0 && line.line as usize == pos.doc_line)
             .collect();
-        for (index, line) in lines.iter().enumerate() {
-            let row = pos.visual_line + virt_off.row as u16 + index as u16;
-            let mut style = self.theme.get(&line.scope);
-            if let Some(opacity) = line.background_opacity {
-                let background = background_style(self.theme, &line.scope, opacity);
-                renderer.set_style(
-                    Rect::new(renderer.viewport.x, row, renderer.viewport.width, 1),
-                    background,
-                );
-                style = style.patch(background);
-            }
-            renderer.draw_custom_text_line(row, &line.text, style);
-        }
+        self.render_lines(renderer, &lines, pos.visual_line + virt_off.row as u16);
         Position::new(lines.len(), 0)
     }
 }
