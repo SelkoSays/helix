@@ -1409,6 +1409,56 @@ fn editor_view_exists(cx: &mut Context, view_id: helix_view::ViewId) -> bool {
     cx.editor.tree.try_get(view_id).is_some()
 }
 
+fn file_fingerprint(path: String) -> Option<(String, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        format!(
+            "{}:{:09}:{}:{}",
+            modified.as_secs(),
+            modified.subsec_nanos(),
+            metadata.dev(),
+            metadata.ino()
+        )
+    };
+
+    #[cfg(not(unix))]
+    let identity = format!("{}:{:09}", modified.as_secs(), modified.subsec_nanos());
+
+    Some((identity, metadata.len()))
+}
+
+#[cfg(test)]
+mod file_fingerprint_tests {
+    use super::file_fingerprint;
+    use std::io::Write;
+
+    #[test]
+    fn fingerprints_regular_files_without_spawning_a_process() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"session fingerprint").unwrap();
+        file.flush().unwrap();
+        let path = file.path().to_string_lossy().into_owned();
+
+        let first = file_fingerprint(path.clone()).unwrap();
+        assert_eq!(first.1, 19);
+        assert_eq!(file_fingerprint(path), Some(first));
+        assert!(
+            file_fingerprint(file.path().with_extension("missing").display().to_string()).is_none()
+        );
+    }
+}
+
 fn load_editor_api(engine: &mut Engine, generate_sources: bool) {
     let mut module = BuiltInModule::new("helix/core/editor");
 
@@ -1535,6 +1585,7 @@ fn load_editor_api(engine: &mut Engine, generate_sources: bool) {
         .register_fn_with_ctx(CTX, "editor->text", document_id_to_text)
         .register_fn_with_ctx(CTX, "editor-document->path", document_path)
         .register_fn_with_ctx(CTX, "editor-document->display-name", document_display_name)
+        .register_fn("file-fingerprint", file_fingerprint)
         .register_fn_with_ctx(CTX, "register->value", cx_register_value)
         .register_fn_with_ctx(
             CTX,

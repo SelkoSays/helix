@@ -352,6 +352,11 @@
 ;;Get the editor display name for a file-backed or named scratch document.
 (define editor-document->display-name helix.editor-document->display-name)
 
+(provide file-fingerprint)
+;;@doc
+;;Return a precise, serializable `(identity size)` fingerprint for a local file.
+(define file-fingerprint helix.file-fingerprint)
+
 (provide register->value)
 ;;@doc
 ;;Get register value as a list of strings.
