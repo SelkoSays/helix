@@ -84,7 +84,10 @@ use crate::{
     commands::{insert, TYPABLE_COMMAND_LIST},
     compositor::{self, Component, Compositor},
     config::Config,
-    events::{OnModeSwitch, PostCommand, PostInsertChar, TerminalFocusGained, TerminalFocusLost},
+    events::{
+        EditorShutdown, OnModeSwitch, PostCommand, PostInsertChar, TerminalFocusGained,
+        TerminalFocusLost,
+    },
     job::{self, Callback, Jobs},
     keymap::{self, merge_keys, KeyTrie, KeymapResult, MappableCommand},
     ui::{self, picker::PathOrId, PickerColumn, Popup, Prompt, PromptEvent},
@@ -3454,6 +3457,7 @@ fn register_hook(event_kind: String, callback_fn: SteelVal) -> steel::UnRecovera
         "post-insert-char" => register_post_insert_char(generation, rooted),
         // Register hook - on save?
         "post-command" => register_post_command(generation, rooted),
+        "editor-shutdown" => register_editor_shutdown(generation, rooted),
         "terminal-focus-gained" => register_terminal_focus_gained(generation, rooted),
         "terminal-focus-lost" => register_terminal_focus_lost(generation, rooted),
         "document-focus-lost" => register_document_focus_lost(generation, rooted),
@@ -3640,6 +3644,17 @@ fn register_post_command(generation: usize, rooted: RootedSteelVal) -> steel::Un
             rooted.value().clone(),
             &mut [event.command.name().into_steelval().unwrap()],
         );
+        Ok(())
+    });
+    Ok(SteelVal::Void).into()
+}
+
+fn register_editor_shutdown(
+    generation: usize,
+    rooted: RootedSteelVal,
+) -> steel::UnRecoverableResult {
+    register_hook!(move |event: &mut EditorShutdown<'_, '_>| {
+        generation_call_with_args(generation, event.cx, rooted.value().clone(), &mut []);
         Ok(())
     });
     Ok(SteelVal::Void).into()

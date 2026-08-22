@@ -109,6 +109,20 @@ fn force_exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
     quit(cx, Args::default(), event)
 }
 
+pub(crate) fn dispatch_editor_shutdown(cx: &mut compositor::Context) {
+    let mut command_context = Context {
+        register: None,
+        count: None,
+        editor: cx.editor,
+        callback: Vec::new(),
+        on_next_key_callback: None,
+        jobs: cx.jobs,
+    };
+    helix_event::dispatch(crate::events::EditorShutdown {
+        cx: &mut command_context,
+    });
+}
+
 fn quit(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     log::debug!("quitting...");
 
@@ -117,11 +131,15 @@ fn quit(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow
     }
 
     // last view and we have unsaved changes
-    if cx.editor.tree.active_views().count() == 1 {
+    let last_view = cx.editor.tree.active_views().count() == 1;
+    if last_view {
         buffers_remaining_impl(cx.editor)?
     }
 
     cx.block_try_flush_writes()?;
+    if last_view {
+        dispatch_editor_shutdown(cx);
+    }
     cx.editor.close(view!(cx.editor).id);
 
     Ok(())
@@ -133,6 +151,9 @@ fn force_quit(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
     }
 
     cx.block_try_flush_writes()?;
+    if cx.editor.tree.active_views().count() == 1 {
+        dispatch_editor_shutdown(cx);
+    }
     cx.editor.close(view!(cx.editor).id);
 
     Ok(())
@@ -1048,6 +1069,8 @@ fn quit_all_impl(cx: &mut compositor::Context, force: bool) -> anyhow::Result<()
     if !force {
         buffers_remaining_impl(cx.editor)?;
     }
+
+    dispatch_editor_shutdown(cx);
 
     cx.editor.restore_all_temporary_layouts();
 

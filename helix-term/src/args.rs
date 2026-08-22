@@ -20,13 +20,24 @@ pub struct Args {
     pub config_file: Option<PathBuf>,
     pub files: IndexMap<PathBuf, Vec<Position>>,
     pub working_directory: Option<PathBuf>,
+    pub session: Option<String>,
+    pub last_session: bool,
 }
 
 impl Args {
     #[allow(clippy::too_many_lines)]
     pub fn parse_args() -> Result<Args> {
+        Self::parse_args_from(std::env::args())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn parse_args_from<I, S>(values: I) -> Result<Args>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let mut args = Args::default();
-        let mut argv = std::env::args().peekable();
+        let mut argv = values.into_iter().map(Into::into).peekable();
         let mut line_number = 0;
 
         let mut insert_file_with_position = |file_with_position: &str| {
@@ -50,6 +61,13 @@ impl Args {
                 "--help" => args.display_help = true,
                 "--strict" => args.strict = true,
                 "--tutor" => args.load_tutor = true,
+                "--last-session" => args.last_session = true,
+                "--session" => match argv.next() {
+                    Some(name) if !name.trim().is_empty() && !name.starts_with('-') => {
+                        args.session = Some(name)
+                    }
+                    _ => anyhow::bail!("--session must specify a non-empty session name"),
+                },
                 "--vsplit" => match args.split {
                     Some(_) => anyhow::bail!("can only set a split once of a specific type"),
                     None => args.split = Some(Layout::Vertical),
@@ -131,7 +149,46 @@ impl Args {
             }
         }
 
+        if args.last_session && args.session.is_some() {
+            anyhow::bail!("--last-session and --session cannot be used together");
+        }
+        if (args.last_session || args.session.is_some())
+            && (args.load_tutor || args.split.is_some() || !args.files.is_empty())
+        {
+            anyhow::bail!(
+                "session startup cannot be combined with files, --tutor, --vsplit, or --hsplit"
+            );
+        }
+
         Ok(args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+
+    fn parse(values: &[&str]) -> anyhow::Result<Args> {
+        Args::parse_args_from(values.iter().copied())
+    }
+
+    #[test]
+    fn parses_session_startup_flags() {
+        let args = parse(&["hx", "--last-session"]).unwrap();
+        assert!(args.last_session);
+        assert!(args.session.is_none());
+
+        let args = parse(&["hx", "--session", "work"]).unwrap();
+        assert_eq!(args.session.as_deref(), Some("work"));
+        assert!(!args.last_session);
+    }
+
+    #[test]
+    fn rejects_ambiguous_session_startup() {
+        assert!(parse(&["hx", "--last-session", "--session", "work"]).is_err());
+        assert!(parse(&["hx", "--session", "work", "file.rs"]).is_err());
+        assert!(parse(&["hx", "--last-session", "--vsplit"]).is_err());
+        assert!(parse(&["hx", "--session"]).is_err());
     }
 }
 

@@ -26,6 +26,7 @@
 ;; * 'document-saved
 ;; * 'document-changed
 ;; * 'document-closed
+;; * 'editor-shutdown
 ;;
 ;; Each of these expects a function with a slightly different signature to accept
 ;; the event payload.
@@ -100,6 +101,12 @@
 ;; ### Example:
 ;; ```scheme
 ;; (register-hook 'document-closed (lambda (closed-event) (log::info! (doc-closed-id closed-event))))
+;; ```
+;;
+;; ## editor-shutdown
+;;
+;; Expects a function with no arguments. It fires once before an accepted
+;; quit, quit-all, cquit, SIGINT, or SIGTERM shuts the editor down.
 (define (register-hook event-kind callback-fn)
   (helix.register-hook event-kind callback-fn))
 

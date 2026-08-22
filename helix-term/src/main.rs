@@ -62,6 +62,8 @@ FLAGS:
     --vsplit                       Split all given files vertically into different windows
     --hsplit                       Split all given files horizontally into different windows
     -w, --working-dir <path>       Specify an initial working directory
+    --last-session                 Restore the globally newest Helix plugin session
+    --session <name>               Restore a named plugin session for the startup directory
     +[N]                           Open the first given file at line number N, or the last line, if
                                    N is not specified.
 ",

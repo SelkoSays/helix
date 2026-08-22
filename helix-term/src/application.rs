@@ -143,6 +143,9 @@ impl Application {
         compositor.push(editor_view);
 
         let mut jobs = Jobs::new();
+        let startup_session = args.session.clone();
+        let startup_last_session = args.last_session;
+        let session_startup = startup_last_session || startup_session.is_some();
         let steel_workspace = args
             .files
             .keys()
@@ -254,12 +257,52 @@ impl Application {
             } else {
                 editor.new_file(Action::VerticalSplit);
             }
+        } else if session_startup {
+            if !stdin().is_terminal() && !cfg!(feature = "integration") {
+                return Err(anyhow::anyhow!(
+                    "session startup cannot be combined with piped standard input"
+                ));
+            }
+            // Session commands need one live view as a host while they restore
+            // files and asynchronously recreate scratch buffers.
+            editor.new_file(Action::VerticalSplit);
         } else if stdin().is_terminal() || cfg!(feature = "integration") {
             editor.new_file(Action::VerticalSplit);
         } else {
             editor
                 .new_file_from_stdin(Action::VerticalSplit)
                 .unwrap_or_else(|_| editor.new_file(Action::VerticalSplit));
+        }
+
+        if session_startup {
+            let mut cx = crate::compositor::Context {
+                editor: &mut editor,
+                jobs: &mut jobs,
+                scroll: None,
+            };
+            let handled = if startup_last_session {
+                ScriptingEngine::call_typed_command(
+                    &mut cx,
+                    "sessions-load-last",
+                    &[],
+                    ui::PromptEvent::Validate,
+                )
+            } else if let Some(name) = startup_session.as_deref() {
+                ScriptingEngine::call_typed_command(
+                    &mut cx,
+                    "sessions-load",
+                    &[name],
+                    ui::PromptEvent::Validate,
+                )
+            } else {
+                false
+            };
+            if !handled {
+                cx.editor.set_error(
+                    "session startup requires the sessions Steel plugin to be registered"
+                        .to_owned(),
+                );
+            }
         }
 
         #[cfg(windows)]
@@ -638,6 +681,12 @@ impl Application {
                 self.render().await;
             }
             signal::SIGTERM | signal::SIGINT => {
+                let mut cx = crate::compositor::Context {
+                    editor: &mut self.editor,
+                    jobs: &mut self.jobs,
+                    scroll: None,
+                };
+                crate::commands::typed::dispatch_editor_shutdown(&mut cx);
                 self.restore_term().unwrap();
                 return false;
             }

@@ -9,6 +9,8 @@ Read annotated command names and documentation from Scheme source without
 compiling or evaluating the source.
 ### **register-discovered-lazy-plugin!**
 Register commands discovered from annotated Scheme source for lazy activation.
+### **register-discovered-logical-lazy-plugin!**
+Register a lazy manifest under a separately cataloged logical plugin ID.
 # /home/le-mrak/.local/share/steel/cogs/helix/treesitter.scm
 ### **TSTree?**
 Check if the given value is a treesitter tree
@@ -3767,6 +3769,9 @@ lines `(line text scope)` rendered after the given zero-based document line.
 ### **set-custom-text-annotations-v2!**
 Replace a namespace like `set-custom-text-annotations!`, plus line backgrounds
 as `(line scope opacity-percent)`. Virtual rows may add an opacity percentage.
+### **set-custom-text-annotations-v3!**
+Replace a namespace like `set-custom-text-annotations-v2!`; virtual-row
+anchor -1 renders before the first document line.
 ### **clear-custom-text-annotations!**
 Clear one custom annotation namespace in the focused view.
 ### **apply-custom-text-edits!**
