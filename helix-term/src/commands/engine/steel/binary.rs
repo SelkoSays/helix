@@ -5,14 +5,13 @@
 //! the opened file and its path still identify the original snapshot.
 
 use std::{
-    fs::{self, File, Metadata},
+    fs::File,
     io,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::SystemTime,
 };
 
 use steel::{
@@ -21,45 +20,16 @@ use steel::{
     SteelErr, SteelVal,
 };
 
-use super::{Context, CTX};
+use super::{
+    file_snapshot::{
+        ensure_snapshot_fresh, open_canonical_regular, snapshot_stale, FileFingerprint,
+    },
+    Context, CTX,
+};
 
 const MAX_READ_BYTES: usize = 1024 * 1024;
 const MAX_PATTERN_BYTES: usize = 4 * 1024;
 const SEARCH_CHUNK_BYTES: usize = 1024 * 1024;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FileFingerprint {
-    len: u64,
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    change_seconds: i64,
-    #[cfg(unix)]
-    change_nanoseconds: i64,
-}
-
-impl FileFingerprint {
-    fn from_metadata(metadata: &Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-
-        Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            change_seconds: metadata.ctime(),
-            #[cfg(unix)]
-            change_nanoseconds: metadata.ctime_nsec(),
-        }
-    }
-}
 
 #[derive(Debug)]
 struct BinaryFile {
@@ -136,49 +106,29 @@ fn read_exact_window(file: &File, offset: u64, length: usize) -> io::Result<Vec<
     Ok(bytes)
 }
 
-fn opened_fingerprint(file: &BinaryFile) -> anyhow::Result<FileFingerprint> {
-    Ok(FileFingerprint::from_metadata(&file.file.metadata()?))
-}
-
-fn path_fingerprint(file: &BinaryFile) -> anyhow::Result<FileFingerprint> {
-    Ok(FileFingerprint::from_metadata(&fs::metadata(&file.path)?))
-}
-
 fn file_stale(file: &BinaryFile) -> bool {
-    file.closed.load(Ordering::Acquire)
-        || opened_fingerprint(file)
-            .and_then(|opened| Ok((opened, path_fingerprint(file)?)))
-            .map(|(opened, path)| opened != file.fingerprint || path != file.fingerprint)
-            .unwrap_or(true)
+    snapshot_stale(
+        &file.file,
+        &file.path,
+        &file.fingerprint,
+        file.closed.load(Ordering::Acquire),
+    )
 }
 
 fn ensure_fresh(file: &BinaryFile) -> anyhow::Result<()> {
-    if file.closed.load(Ordering::Acquire) {
-        anyhow::bail!("binary file handle is closed");
-    }
-    if file_stale(file) {
-        anyhow::bail!("binary file changed on disk; refresh the viewer");
-    }
-    Ok(())
+    ensure_snapshot_fresh(
+        &file.file,
+        &file.path,
+        &file.fingerprint,
+        file.closed.load(Ordering::Acquire),
+        "binary file",
+        "refresh the viewer",
+    )
 }
 
 fn binary_file_open(path: String) -> anyhow::Result<SteelBinaryFile> {
-    if path.trim().is_empty() || path.contains("://") || path.starts_with("file:") {
-        anyhow::bail!("binary file path must be a non-empty local path");
-    }
-    let canonical = fs::canonicalize(&path)?;
-    let file = File::open(&canonical)?;
-    let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() {
-        anyhow::bail!("binary viewer accepts regular files only");
-    }
-    if metadata.len() > usize::MAX as u64 {
-        anyhow::bail!("binary file is too large for this platform");
-    }
-    let fingerprint = FileFingerprint::from_metadata(&metadata);
-    if FileFingerprint::from_metadata(&fs::metadata(&canonical)?) != fingerprint {
-        anyhow::bail!("binary file changed while it was being opened");
-    }
+    let (file, canonical, fingerprint) =
+        open_canonical_regular(&path, "binary file", "binary viewer")?;
     Ok(SteelBinaryFile(Arc::new(BinaryFile {
         file,
         path: canonical,

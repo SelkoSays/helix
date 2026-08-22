@@ -9,10 +9,14 @@ use steel::steel_vm::builtin::BuiltInModule;
 
 // Declared here rather than in the Steel `mod.rs` so the whole extension
 // surface stays behind this one registrar.
+#[path = "archive.rs"]
+mod archive;
 #[path = "binary.rs"]
 mod binary;
 #[path = "diagnostic_snapshot.rs"]
 mod diagnostic_snapshot;
+#[path = "file_snapshot.rs"]
+mod file_snapshot;
 #[path = "json.rs"]
 mod json;
 #[path = "markdown_preview.rs"]
@@ -263,6 +267,19 @@ fn register_binary(engine: &mut Engine, generate_sources: bool) {
     engine.register_module(module);
 }
 
+fn register_archive(engine: &mut Engine, generate_sources: bool) {
+    let mut module = BuiltInModule::new("helix/core/archive");
+    archive::register(&mut module);
+
+    let source = include_str!("archive.scm");
+    if generate_sources {
+        generate_module("archive.scm", source);
+        configure_lsp_builtins("archive", &module);
+    }
+    engine.register_steel_module("helix/archive.scm".to_string(), source.to_string());
+    engine.register_module(module);
+}
+
 fn register_markdown_preview(engine: &mut Engine, generate_sources: bool) {
     let mut module = BuiltInModule::new("helix/core/markdown-preview");
     markdown_preview::register(&mut module);
@@ -285,6 +302,7 @@ pub(super) fn register_builtin(engine: &mut Engine, generate_sources: bool) {
     register_regex(engine, generate_sources);
     register_json(engine, generate_sources);
     register_binary(engine, generate_sources);
+    register_archive(engine, generate_sources);
     register_markdown_preview(engine, generate_sources);
 }
 

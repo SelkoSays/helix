@@ -96,6 +96,23 @@ steel-program-linker = { workspace = true, optional = true }
 globset = "0.4.16"
 dashmap = "6.2"
 
+# Bounded read-only archive inspection. ZIP encryption features are
+# intentionally omitted.
+zip = { version = "=8.6.0", default-features = false, features = [
+  "bzip2",
+  "deflate-flate2-zlib-rs",
+  "deflate64",
+  "lzma",
+  "ppmd",
+  "xz",
+  "zstd",
+] }
+tar = "=0.4.46"
+flate2 = "1"
+bzip2 = "0.6"
+xz2 = "0.1"
+zstd = "0.13"
+
 parking_lot.workspace = true
 
 [target.'cfg(windows)'.dependencies]
