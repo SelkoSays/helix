@@ -37,6 +37,7 @@ pub(super) fn register(module: &mut BuiltInModule) {
         .register_fn("regex-full-match?", full_match)
         .register_fn("regex-find", find)
         .register_fn("regex-find-all", find_all)
+        .register_fn("regex-find-captures", find_captures)
         .register_fn("regex-replace-all", replace_all)
         .register_fn("regex-expand-match", expand_match);
 }
@@ -86,6 +87,31 @@ fn find_all(regex: &SteelRegex, text: String) -> SteelVal {
             })
             .collect(),
     )
+}
+
+/// Return every capture of the first match while preserving capture indexes.
+///
+/// Capture zero is the complete match. Optional captures that did not
+/// participate are represented by `#false`, so callers can select a numbered
+/// capture without maintaining a second index map. As with the rest of this
+/// module, every range crossing the Steel boundary uses character offsets.
+fn find_captures(regex: &SteelRegex, text: String) -> Option<SteelVal> {
+    let captures = regex.regex.captures(&text)?;
+    let mut converter = ByteToChar::new(&text);
+    Some(SteelVal::ListV(
+        captures
+            .iter()
+            .map(|capture| {
+                capture
+                    .map(|matched| {
+                        let start = converter.convert(matched.start());
+                        let end = converter.convert(matched.end());
+                        range(start, end)
+                    })
+                    .unwrap_or(SteelVal::BoolV(false))
+            })
+            .collect(),
+    ))
 }
 
 /// Replace every match, expanding `$1` and `${name}` capture references in the
@@ -276,6 +302,45 @@ mod tests {
             ranges(find_all(&regex, "aaaa".to_string())),
             vec![(0, 2), (2, 4)]
         );
+    }
+
+    #[test]
+    fn captures_preserve_indexes_and_unicode_character_offsets() {
+        let regex = compile("界(?<word>[a-z]+)([0-9]+)?".to_string()).unwrap();
+        let SteelVal::ListV(captures) =
+            find_captures(&regex, "x界hello".to_string()).expect("expected captures")
+        else {
+            panic!("captures are not a list")
+        };
+        assert_eq!(captures.len(), 3);
+        assert_eq!(one(Some(captures[0].clone())), (1, 7));
+        assert_eq!(one(Some(captures[1].clone())), (2, 7));
+        assert_eq!(captures[2], SteelVal::BoolV(false));
+    }
+
+    #[test]
+    fn captures_handle_empty_alternating_and_unmatched_inputs() {
+        let regex = compile("(a)|()".to_string()).unwrap();
+        let SteelVal::ListV(left) =
+            find_captures(&regex, "a".to_string()).expect("expected left alternative")
+        else {
+            panic!("captures are not a list")
+        };
+        assert_eq!(one(Some(left[0].clone())), (0, 1));
+        assert_eq!(one(Some(left[1].clone())), (0, 1));
+        assert_eq!(left[2], SteelVal::BoolV(false));
+
+        let empty = compile("()".to_string()).unwrap();
+        let SteelVal::ListV(empty_captures) =
+            find_captures(&empty, "value".to_string()).expect("expected empty capture")
+        else {
+            panic!("captures are not a list")
+        };
+        assert_eq!(one(Some(empty_captures[0].clone())), (0, 0));
+        assert_eq!(one(Some(empty_captures[1].clone())), (0, 0));
+
+        let missing = compile("z+".to_string()).unwrap();
+        assert!(find_captures(&missing, "value".to_string()).is_none());
     }
 
     #[test]

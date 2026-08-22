@@ -6,6 +6,7 @@
          regex-full-match?
          regex-find
          regex-find-all
+         regex-find-captures
          regex-replace-all
          regex-expand-match)
 
@@ -36,6 +37,12 @@
 ;;@doc
 ;; Every non-overlapping match as a list of `(start end)` character ranges.
 (define regex-find-all helix.regex-find-all)
+
+;;@doc
+;; Return the first match's capture ranges by numeric index, including group
+;; zero. Each participating capture is a `(start end)` character range and an
+;; unmatched optional capture is `#false`; no match returns `#false`.
+(define regex-find-captures helix.regex-find-captures)
 
 ;;@doc
 ;; Replace every match, expanding `$1` and `${name}` capture references in the
