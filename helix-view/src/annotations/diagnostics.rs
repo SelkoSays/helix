@@ -6,6 +6,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::Document;
 
+// Provider and opaque `data` fields control diagnostic ownership and code
+// actions, but they do not change what the inline/eol renderer shows. Keep
+// both values in the document and collapse only their visual presentation so
+// clearing either provider cannot accidentally remove the other's diagnostic.
+fn same_visible_diagnostic(left: &Diagnostic, right: &Diagnostic) -> bool {
+    left.range == right.range
+        && left.message == right.message
+        && left.severity == right.severity
+        && left.code == right.code
+        && left.source == right.source
+}
+
 /// Describes the severity level of a [`Diagnostic`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
 pub enum DiagnosticFilter {
@@ -203,7 +215,13 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
             if diag.range.start != grapheme.char_idx {
                 break;
             }
-            self.stack.push((diag, anchor_col as u16));
+            if !self
+                .stack
+                .iter()
+                .any(|(candidate, _)| same_visible_diagnostic(candidate, diag))
+            {
+                self.stack.push((diag, anchor_col as u16));
+            }
             self.idx += 1;
         }
         false
@@ -251,6 +269,57 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
         self.stack
             .last()
             .is_some_and(|&(_, anchor)| anchor > self.config.max_diagnostic_start(width))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_core::diagnostic::{DiagnosticProvider, LanguageServerId};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn diagnostic(provider: DiagnosticProvider) -> Diagnostic {
+        Diagnostic {
+            range: helix_core::diagnostic::Range { start: 2, end: 5 },
+            ends_at_word: true,
+            starts_at_word: true,
+            zero_width: false,
+            line: 0,
+            message: "same failure".into(),
+            severity: Some(Severity::Error),
+            code: None,
+            tags: Vec::new(),
+            source: Some("go compiler".into()),
+            data: None,
+            provider,
+        }
+    }
+
+    #[test]
+    fn duplicate_visuals_ignore_provider_and_opaque_data() {
+        let lsp = diagnostic(DiagnosticProvider::Lsp {
+            server_id: LanguageServerId::default(),
+            identifier: None,
+        });
+        let mut external = diagnostic(DiagnosticProvider::External {
+            namespace: Arc::from("task-run"),
+        });
+        external.data = Some(json!({"owner": "task"}));
+
+        assert!(same_visible_diagnostic(&lsp, &external));
+    }
+
+    #[test]
+    fn distinct_messages_remain_visible() {
+        let first = diagnostic(DiagnosticProvider::Lsp {
+            server_id: LanguageServerId::default(),
+            identifier: None,
+        });
+        let mut second = first.clone();
+        second.message = "different failure".into();
+
+        assert!(!same_visible_diagnostic(&first, &second));
     }
 }
 
