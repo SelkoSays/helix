@@ -1290,6 +1290,19 @@ use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 
+/// Keep provider ownership intact while discarding repeated values inside one
+/// publication. Some servers occasionally send the same diagnostic more than
+/// once, and external-diagnostic refreshes must not make that visible inline.
+pub(crate) fn deduplicate_lsp_diagnostics(diagnostics: &mut Vec<lsp::Diagnostic>) {
+    let mut unique = Vec::with_capacity(diagnostics.len());
+    for diagnostic in diagnostics.drain(..) {
+        if !unique.contains(&diagnostic) {
+            unique.push(diagnostic);
+        }
+    }
+    *diagnostics = unique;
+}
+
 mod external_diagnostics;
 mod linked_scroll;
 mod plugin_layout;

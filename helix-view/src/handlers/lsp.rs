@@ -300,6 +300,8 @@ impl Editor {
             }
         }
 
+        crate::editor::deduplicate_lsp_diagnostics(&mut diagnostics);
+
         let mut unchanged_diag_sources = Vec::new();
         if let Some((lang_conf, old_diagnostics)) = doc
             .as_ref()

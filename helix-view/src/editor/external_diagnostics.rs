@@ -1,4 +1,4 @@
-use super::{Diagnostics, Editor};
+use super::{deduplicate_lsp_diagnostics, Diagnostics, Editor};
 use crate::Document;
 use helix_core::{
     diagnostic::{Diagnostic, DiagnosticProvider},
@@ -96,12 +96,15 @@ pub(super) fn to_core_diagnostic(
 fn replace_namespace(
     diagnostics: &mut Diagnostics,
     provider: &DiagnosticProvider,
-    grouped: BTreeMap<Uri, Vec<lsp::Diagnostic>>,
+    mut grouped: BTreeMap<Uri, Vec<lsp::Diagnostic>>,
 ) {
     for existing in diagnostics.values_mut() {
         existing.retain(|(_, candidate)| candidate != provider);
     }
     diagnostics.retain(|_, values| !values.is_empty());
+    for values in grouped.values_mut() {
+        deduplicate_lsp_diagnostics(values);
+    }
     for (uri, values) in grouped {
         diagnostics.entry(uri).or_default().extend(
             values
@@ -196,6 +199,15 @@ mod tests {
     }
 
     #[test]
+    fn exact_diagnostic_values_are_deduplicated_per_publication() {
+        let mut diagnostics = vec![raw("same"), raw("same"), raw("different")];
+        deduplicate_lsp_diagnostics(&mut diagnostics);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].message, "same");
+        assert_eq!(diagnostics[1].message, "different");
+    }
+
+    #[test]
     fn replacement_and_clear_preserve_lsp_and_other_namespaces() {
         let uri = Uri::from(helix_stdx::path::canonicalize("test.rs"));
         let lsp_provider = DiagnosticProvider::Lsp {
@@ -241,6 +253,48 @@ mod tests {
         let values = &diagnostics[&uri];
         assert_eq!(values.len(), 2);
         assert!(values.iter().all(|(_, provider)| provider != &first));
+    }
+
+    #[test]
+    fn replacement_deduplicates_its_namespace_without_multiplying_lsp_entries() {
+        let uri = Uri::from(helix_stdx::path::canonicalize("test.rs"));
+        let lsp_provider = DiagnosticProvider::Lsp {
+            server_id: LanguageServerId::default(),
+            identifier: None,
+        };
+        let external_provider = DiagnosticProvider::External {
+            namespace: Arc::from("task-run"),
+        };
+        let mut diagnostics =
+            BTreeMap::from([(uri.clone(), vec![(raw("lsp"), lsp_provider.clone())])]);
+
+        replace_namespace(
+            &mut diagnostics,
+            &external_provider,
+            BTreeMap::from([(uri.clone(), vec![raw("task"), raw("task")])]),
+        );
+
+        let values = &diagnostics[&uri];
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            values
+                .iter()
+                .filter(|(_, provider)| *provider == lsp_provider)
+                .count(),
+            1
+        );
+        assert_eq!(
+            values
+                .iter()
+                .filter(|(_, provider)| *provider == external_provider)
+                .count(),
+            1
+        );
+
+        clear_namespace(&mut diagnostics, "task-run");
+        let values = &diagnostics[&uri];
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].1, lsp_provider);
     }
 
     #[test]
