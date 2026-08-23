@@ -3797,6 +3797,7 @@ fn configure_lsp_globals() {
         "log::warn",
         "log::error",
         "fuzzy-match",
+        "fuzzy-match-indices",
         "helix-find-workspace",
         "find-workspace",
         "doc-id->usize",
@@ -4155,7 +4156,8 @@ fn load_misc_api(engine: &mut Engine, generate_sources: bool) {
         .register_fn_with_ctx(CTX, "add-inlay-hint", add_inlay_hint)
         .register_fn_with_ctx(CTX, "remove-inlay-hint", remove_inlay_hint)
         .register_fn_with_ctx(CTX, "remove-inlay-hint-by-id", remove_inlay_hint_by_id)
-        .register_fn("fuzzy-match", fuzzy_match);
+        .register_fn("fuzzy-match", fuzzy_match)
+        .register_fn("fuzzy-match-indices", fuzzy_match_indices);
 
     custom_text_annotations::register(&mut module);
     custom_text_edits::register(&mut module);
@@ -4344,6 +4346,58 @@ fn fuzzy_match(pattern: SteelString, items: SteelVal) -> Vec<SteelVal> {
     Vec::new()
 }
 
+struct IndexedFuzzyCandidate<'a> {
+    index: usize,
+    text: &'a str,
+}
+
+impl AsRef<str> for IndexedFuzzyCandidate<'_> {
+    fn as_ref(&self) -> &str {
+        self.text
+    }
+}
+
+fn fuzzy_match_indices(pattern: SteelString, items: SteelVal) -> Vec<SteelVal> {
+    if let SteelVal::ListV(items) = items {
+        let candidates = items.iter().enumerate().filter_map(|(index, value)| {
+            if let SteelVal::StringV(text) = value {
+                Some(IndexedFuzzyCandidate {
+                    index,
+                    text: text.as_str(),
+                })
+            } else {
+                None
+            }
+        });
+        return helix_core::fuzzy::fuzzy_match(pattern.as_str(), candidates, false)
+            .into_iter()
+            .map(|candidate| SteelVal::IntV(candidate.0.index as isize))
+            .collect();
+    }
+
+    Vec::new()
+}
+
+#[cfg(test)]
+mod fuzzy_match_index_tests {
+    use super::{fuzzy_match_indices, SteelString, SteelVal};
+    use steel::rvals::IntoSteelVal;
+
+    #[test]
+    fn preserves_indices_for_duplicate_candidate_text() {
+        let candidates = SteelVal::ListV(
+            vec![
+                "same".to_string().into_steelval().unwrap(),
+                "different".to_string().into_steelval().unwrap(),
+                "same".to_string().into_steelval().unwrap(),
+            ]
+            .into(),
+        );
+        let indices = fuzzy_match_indices(SteelString::from("same"), candidates);
+        assert_eq!(indices, vec![SteelVal::IntV(0), SteelVal::IntV(2)]);
+    }
+}
+
 fn configure_engine_impl(
     mut engine: Engine,
     generate_sources: bool,
@@ -4434,6 +4488,7 @@ fn configure_engine_impl(
     });
 
     engine.register_fn("fuzzy-match", fuzzy_match);
+    engine.register_fn("fuzzy-match-indices", fuzzy_match_indices);
 
     // Find the workspace
     engine.register_fn("helix-find-workspace", || {

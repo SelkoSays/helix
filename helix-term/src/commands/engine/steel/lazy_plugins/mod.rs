@@ -209,6 +209,23 @@ fn register_async_lazy_plugin(
     )
 }
 
+fn register_logical_lazy_plugin(
+    logical_name: String,
+    name: String,
+    modules: Vec<String>,
+    initializers: Vec<String>,
+    command_docs: HashMap<String, String>,
+) -> Result<(), SteelErr> {
+    register_plugin(
+        logical_name,
+        name,
+        modules,
+        initializers,
+        command_docs,
+        RegistrationKind::Lazy,
+    )
+}
+
 fn discover_lazy_commands(sources: Vec<String>) -> Result<HashMap<String, String>, SteelErr> {
     discover_commands(&sources)
 }
@@ -495,6 +512,10 @@ pub(super) fn register_builtin(engine: &mut Engine, generate_sources: bool) {
     module
         .register_fn("#%register-lazy-plugin!", register_lazy_plugin)
         .register_fn("#%register-async-lazy-plugin!", register_async_lazy_plugin)
+        .register_fn(
+            "#%register-logical-lazy-plugin!",
+            register_logical_lazy_plugin,
+        )
         .register_fn("#%discover-lazy-commands", discover_lazy_commands)
         .register_fn(
             "#%register-discovered-lazy-plugin!",

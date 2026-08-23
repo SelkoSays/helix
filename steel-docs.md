@@ -4,6 +4,9 @@ Register commands whose modules and initializers run on first invocation.
 ### **register-async-lazy-plugin!**
 Register lazy commands and queue compilation after init.scm completes.
 Evaluation and initialization still happen on first invocation.
+### **register-logical-lazy-plugin!**
+Register a logical lazy manifest using precomputed command documentation.
+This avoids runtime source discovery while retaining native validation.
 ### **discover-lazy-commands**
 Read annotated command names and documentation from Scheme source without
 compiling or evaluating the source.
@@ -2157,6 +2160,38 @@ Check whether the given event is the key: keypad-begin
 (key-event-keypad-begin? event)
 ```
 event: Event?
+# /home/le-mrak/.local/share/steel/cogs/helix/archive.scm
+### **archive-cancel-token**
+Create a cancellation token for one asynchronous archive operation.
+### **archive-cancel!**
+Cancel an archive operation. Repeated cancellation returns false.
+### **archive-open-async**
+Open and index a supported local archive asynchronously. The callback
+receives `(ok handle)`, `(cancelled #false)`, `(stale #false)`, or
+`(error message)`. Indexing permits at most 100,000 entries, 32 KiB paths,
+32 MiB retained metadata, and a 512 MiB decompressed TAR scan.
+### **archive-close!**
+Close an archive handle. Repeated closure returns false.
+### **archive-path**
+Return the canonical UTF-8 source path retained by an archive handle.
+### **archive-format**
+Return the detected archive format symbol.
+### **archive-fingerprint**
+Return the source `(identity size)` fingerprint captured during indexing.
+### **archive-entry-count**
+Return the number of indexed members, including duplicate paths.
+### **archive-closed?**
+Return true after an archive handle has been explicitly closed.
+### **archive-stale?**
+Return true when an archive handle is closed or its source changed.
+### **archive-entries-page**
+Return a bounded metadata page. Each row contains stable index, lossy path,
+type, uncompressed/compressed sizes, mode, timestamp, link target,
+compression method, and encrypted flag. One page is limited to 10,000 rows.
+### **archive-entry-read-async**
+Read one bounded uncompressed entry range asynchronously. The callback
+receives `(ok bytevector truncated?)` or a cancellation/stale/error status.
+Offsets are limited to 64 MiB and each read to one MiB.
 # /home/le-mrak/.local/share/steel/cogs/helix/json.scm
 ### **json-parse**
 Parse one JSON value into ordinary Steel values. The optional byte limit
@@ -2980,6 +3015,10 @@ pattern is anchored at both ends before testing.
 The first match as a `(start end)` character range, or #false.
 ### **regex-find-all**
 Every non-overlapping match as a list of `(start end)` character ranges.
+### **regex-find-captures**
+Return the first match's capture ranges by numeric index, including group
+zero. Each participating capture is a `(start end)` character range and an
+unmatched optional capture is `#false`; no match returns `#false`.
 ### **regex-replace-all**
 Replace every match, expanding `$1` and `${name}` capture references in the
 replacement.
@@ -3012,6 +3051,7 @@ The valid events are as follows:
 * 'document-saved
 * 'document-changed
 * 'document-closed
+* 'editor-shutdown
 
 Each of these expects a function with a slightly different signature to accept
 the event payload.
@@ -3086,6 +3126,12 @@ Expects a function with one argument to accept the `OnDocClosedEvent`
 ### Example:
 ```scheme
 (register-hook 'document-closed (lambda (closed-event) (log::info! (doc-closed-id closed-event))))
+```
+
+## editor-shutdown
+
+Expects a function with no arguments. It fires once before an accepted
+quit, quit-all, cquit, SIGINT, or SIGTERM shuts the editor down.
 ### **editor-focus**
 
 Get the current focus of the editor, as a `ViewId`.
@@ -3200,6 +3246,8 @@ Get the document as a rope.
 Get the path to a document.
 ### **editor-document->display-name**
 Get the editor display name for a file-backed or named scratch document.
+### **file-fingerprint**
+Return a precise, serializable `(identity size)` fingerprint for a local file.
 ### **register->value**
 Get register value as a list of strings.
 ### **set-editor-clip-top!**
@@ -3787,6 +3835,12 @@ thread, effectively blocking the UI.
 ```
 pattern : string?
 input-list : (list? string?)
+### **fuzzy-match-indices**
+Fuzzy match the complete string list and return ranked zero-based source
+indices. Duplicate strings retain distinct identities.
+```scheme
+(fuzzy-match-indices pattern input-list) -> (list? integer?)
+```
 # /home/le-mrak/.local/share/steel/cogs/helix/keymaps.scm
 ### ***reverse-buffer-map-insert***
 Insert a value into the reverse buffer map

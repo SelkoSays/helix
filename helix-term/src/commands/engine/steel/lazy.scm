@@ -2,6 +2,7 @@
 
 (provide register-lazy-plugin!
          register-async-lazy-plugin!
+         register-logical-lazy-plugin!
          discover-lazy-commands
          register-discovered-lazy-plugin!
          register-discovered-logical-lazy-plugin!
@@ -21,6 +22,11 @@
 ;; Register lazy commands and queue compilation after init.scm completes.
 ;; Evaluation and initialization still happen on first invocation.
 (define register-async-lazy-plugin! lazy.#%register-async-lazy-plugin!)
+
+;;@doc
+;; Register a logical lazy manifest using precomputed command documentation.
+;; This avoids runtime source discovery while retaining native validation.
+(define register-logical-lazy-plugin! lazy.#%register-logical-lazy-plugin!)
 
 ;;@doc
 ;; Read annotated command names and documentation from Scheme source without

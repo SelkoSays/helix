@@ -367,3 +367,12 @@
 ;; pattern : string?
 ;; input-list : (list? string?)
 (define fuzzy-match helix.fuzzy-match)
+
+(provide fuzzy-match-indices)
+;;@doc
+;; Fuzzy match the complete string list and return ranked zero-based source
+;; indices. Duplicate strings retain distinct identities.
+;; ```scheme
+;; (fuzzy-match-indices pattern input-list) -> (list? integer?)
+;; ```
+(define fuzzy-match-indices helix.fuzzy-match-indices)

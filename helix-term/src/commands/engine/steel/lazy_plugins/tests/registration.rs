@@ -20,6 +20,67 @@ fn completion_and_docs_exist_before_loading() {
 }
 
 #[test]
+fn preindexed_logical_manifest_retains_ownership_and_docs() {
+    let _test = TEST_LOCK.lock().unwrap();
+    reset_test_registry();
+    register_logical_plugin("catalog".into(), vec!["catalog.scm".into()]).unwrap();
+    register_logical_lazy_plugin(
+        "catalog".into(),
+        "catalog/first".into(),
+        vec!["first.scm".into()],
+        Vec::new(),
+        docs("catalog-first"),
+    )
+    .unwrap();
+    register_logical_lazy_plugin(
+        "catalog".into(),
+        "catalog/second".into(),
+        vec!["second.scm".into()],
+        Vec::new(),
+        docs("catalog-second"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        documentation("catalog-first").as_deref(),
+        Some("Documentation for catalog-first")
+    );
+    assert_eq!(
+        logical_plugin_strategy("catalog".into()).as_deref(),
+        Some("lazy")
+    );
+    let registry = REGISTRY.0.lock().unwrap();
+    assert_eq!(
+        registry.logical_plugins["catalog"].manifests,
+        vec!["catalog/first", "catalog/second"]
+    );
+}
+
+#[test]
+fn preindexed_logical_manifest_uses_existing_validation() {
+    let _test = TEST_LOCK.lock().unwrap();
+    reset_test_registry();
+    register_logical_plugin("catalog".into(), vec!["catalog.scm".into()]).unwrap();
+
+    assert!(register_logical_lazy_plugin(
+        "catalog".into(),
+        "catalog/empty".into(),
+        vec!["empty.scm".into()],
+        Vec::new(),
+        HashMap::new(),
+    )
+    .is_err());
+    assert!(register_logical_lazy_plugin(
+        "catalog".into(),
+        "catalog/builtin".into(),
+        vec!["builtin.scm".into()],
+        Vec::new(),
+        docs("quit"),
+    )
+    .is_err());
+}
+
+#[test]
 fn builtin_source_setup_can_load_lazy_dependent_modules() {
     let _test = TEST_LOCK.lock().unwrap();
     let mut engine = Engine::new();
